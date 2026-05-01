@@ -344,7 +344,12 @@ class QunHelperPlugin(Star):
             "欢迎新成员 {user_id} 加入本群，当前时间：{time}。",
         )
         try:
-            return template.format(group_id=group_id, user_id=user_id, time=notify_time)
+            message = template.format(
+                group_id=group_id,
+                user_id=user_id,
+                time=notify_time,
+            )
+            return self._ensure_time_visible(message, notify_time)
         except Exception:
             logger.warning("welcome_template 格式错误，已回退到默认欢迎语。")
             return f"欢迎新成员 {user_id} 加入本群，当前时间：{notify_time}。"
@@ -362,13 +367,14 @@ class QunHelperPlugin(Star):
             "成员 {user_id} 已离开本群，当前时间：{time}。",
         )
         try:
-            return template.format(
+            message = template.format(
                 group_id=group_id,
                 user_id=user_id,
                 operator_id=operator_id,
                 sub_type=sub_type,
                 time=notify_time,
             )
+            return self._ensure_time_visible(message, notify_time)
         except Exception:
             logger.warning("leave_template 格式错误，已回退到默认退群通知。")
             return f"成员 {user_id} 已离开本群，当前时间：{notify_time}。"
@@ -418,6 +424,18 @@ class QunHelperPlugin(Star):
     def _is_http_url(value: str) -> bool:
         lower = value.lower()
         return lower.startswith("http://") or lower.startswith("https://")
+
+    @staticmethod
+    def _ensure_time_visible(message: str, notify_time: str) -> str:
+        text = str(message or "").strip()
+        if not text:
+            return f"当前时间：{notify_time}"
+
+        # 兼容历史模板：如果模板未包含时间占位符，统一在末尾补充时间
+        if notify_time not in text:
+            return f"{text} 当前时间：{notify_time}"
+
+        return text
 
     @staticmethod
     def _format_now_str() -> str:

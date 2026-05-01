@@ -35,11 +35,11 @@
     "default": [],
     "hint": "仅向这些群发送定时消息"
   },
-  "schedule_interval_seconds": {
-    "description": "定时发送间隔(秒)",
-    "type": "int",
-    "default": 3600,
-    "hint": "建议 >= 60，插件内部最小限制为 10 秒"
+  "schedule_daily_time": {
+    "description": "每日发送时间(HH:MM)",
+    "type": "string",
+    "default": "09:00",
+    "hint": "24 小时制，例如 09:00 或 21:30"
   },
   "schedule_message": {
     "description": "定时发送内容",

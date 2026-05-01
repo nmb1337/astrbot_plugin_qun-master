@@ -1,5 +1,6 @@
 import asyncio
 import time
+from datetime import datetime
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
@@ -22,6 +23,9 @@ class QunHelperPlugin(Star):
         self._recent_welcome_keys: dict[str, float] = {}
         self._welcome_dedupe_seconds = 30
         self._welcome_cache_ttl_seconds = 300
+
+        # 防止定时消息在同一天内重复发送
+        self._last_schedule_fire_key: str | None = None
 
     async def initialize(self):
         self._scheduler_task = asyncio.create_task(self._scheduled_sender_loop())
@@ -164,11 +168,16 @@ class QunHelperPlugin(Star):
 
     async def _scheduled_sender_loop(self):
         while self._running:
-            interval = self._get_schedule_interval()
-            await asyncio.sleep(interval)
+            await asyncio.sleep(15)
 
             if not self._get_bool("enable_schedule", False):
                 continue
+
+            should_send, fire_key = self._should_fire_daily_schedule()
+            if not should_send:
+                continue
+
+            self._last_schedule_fire_key = fire_key
 
             groups = self._get_str_list("schedule_group_whitelist")
             msg = self._get_text("schedule_message", "群通知：请文明发言，遵守群规。")
@@ -263,15 +272,44 @@ class QunHelperPlugin(Star):
                 result.append(text)
         return result
 
-    def _get_schedule_interval(self) -> int:
-        raw_interval = self.config.get("schedule_interval_seconds", 3600)
-        try:
-            interval = int(raw_interval)
-        except Exception:
-            interval = 3600
+    def _should_fire_daily_schedule(self) -> tuple[bool, str]:
+        schedule_time = self._get_text("schedule_daily_time", "09:00")
+        parsed = self._parse_daily_time(schedule_time)
+        if parsed is None:
+            parsed = (9, 0)
 
-        # 最小 10 秒，避免误配置导致高频刷屏
-        return max(interval, 10)
+        now = datetime.now()
+        hour, minute = parsed
+        fire_key = f"{now.date().isoformat()}-{hour:02d}:{minute:02d}"
+
+        if self._last_schedule_fire_key == fire_key:
+            return False, fire_key
+
+        if now.hour == hour and now.minute == minute:
+            return True, fire_key
+
+        return False, fire_key
+
+    @staticmethod
+    def _parse_daily_time(raw: str) -> tuple[int, int] | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+
+        parts = text.split(":")
+        if len(parts) != 2:
+            return None
+
+        hour_str, minute_str = parts
+        if not hour_str.isdigit() or not minute_str.isdigit():
+            return None
+
+        hour = int(hour_str)
+        minute = int(minute_str)
+        if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+            return None
+
+        return hour, minute
 
     @staticmethod
     def _extract_command_payload(event: AstrMessageEvent, command_name: str) -> str:

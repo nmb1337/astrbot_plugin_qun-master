@@ -22,7 +22,7 @@
 - `welcome_template`：欢迎语模板，支持 `{user_id}` 和 `{group_id}`。
 - `enable_schedule`：是否启用定时发送。
 - `schedule_group_whitelist`：允许接收定时消息的群号白名单。
-- `schedule_interval_seconds`：定时发送间隔（秒）。
+- `schedule_daily_time`：每天固定发送时间（格式 `HH:MM`，24 小时制）。
 - `schedule_message`：定时发送的固定文本。
 
 ## 注意事项

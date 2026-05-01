@@ -85,6 +85,83 @@ class QunHelperPlugin(Star):
                 exc,
             )
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("开启欢迎")
+    async def enable_welcome_command(self, event: AstrMessageEvent):
+        self.config["enable_welcome"] = True
+        await self._persist_config()
+        yield event.plain_result("已开启入群欢迎。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("关闭欢迎")
+    async def disable_welcome_command(self, event: AstrMessageEvent):
+        self.config["enable_welcome"] = False
+        await self._persist_config()
+        yield event.plain_result("已关闭入群欢迎。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("查看当前白名单")
+    async def show_welcome_whitelist_command(self, event: AstrMessageEvent):
+        whitelist = self._get_str_list("welcome_group_whitelist")
+        if not whitelist:
+            yield event.plain_result("当前入群欢迎白名单为空。")
+            return
+
+        lines = ["当前入群欢迎白名单："]
+        for idx, group_id in enumerate(whitelist, start=1):
+            lines.append(f"{idx}. {group_id}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("设置欢迎语")
+    async def set_welcome_template_command(self, event: AstrMessageEvent):
+        template = self._extract_command_payload(event, "设置欢迎语")
+        if not template:
+            yield event.plain_result(
+                "用法：/设置欢迎语 欢迎新成员 {user_id} 加入群 {group_id}"
+            )
+            return
+
+        self.config["welcome_template"] = template
+        await self._persist_config()
+        yield event.plain_result("已更新欢迎语模板。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("添加白名单")
+    async def add_welcome_whitelist_command(self, event: AstrMessageEvent):
+        group_id = self._extract_group_id_arg(event, "添加白名单")
+        if not group_id:
+            yield event.plain_result("用法：/添加白名单 群号")
+            return
+
+        whitelist = self._get_str_list("welcome_group_whitelist")
+        if group_id in whitelist:
+            yield event.plain_result(f"群 {group_id} 已在白名单中。")
+            return
+
+        whitelist.append(group_id)
+        self.config["welcome_group_whitelist"] = whitelist
+        await self._persist_config()
+        yield event.plain_result(f"已添加白名单群号：{group_id}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("移除白名单")
+    async def remove_welcome_whitelist_command(self, event: AstrMessageEvent):
+        group_id = self._extract_group_id_arg(event, "移除白名单")
+        if not group_id:
+            yield event.plain_result("用法：/移除白名单 群号")
+            return
+
+        whitelist = self._get_str_list("welcome_group_whitelist")
+        if group_id not in whitelist:
+            yield event.plain_result(f"群 {group_id} 不在白名单中。")
+            return
+
+        new_whitelist = [gid for gid in whitelist if gid != group_id]
+        self.config["welcome_group_whitelist"] = new_whitelist
+        await self._persist_config()
+        yield event.plain_result(f"已移除白名单群号：{group_id}")
+
     async def _scheduled_sender_loop(self):
         while self._running:
             interval = self._get_schedule_interval()
@@ -195,3 +272,41 @@ class QunHelperPlugin(Star):
 
         # 最小 10 秒，避免误配置导致高频刷屏
         return max(interval, 10)
+
+    @staticmethod
+    def _extract_command_payload(event: AstrMessageEvent, command_name: str) -> str:
+        text = str(event.message_str or "").strip()
+        if not text:
+            return ""
+
+        if text.startswith("/") or text.startswith("／"):
+            text = text[1:].strip()
+
+        if text.startswith(command_name):
+            return text[len(command_name) :].strip()
+
+        return ""
+
+    @classmethod
+    def _extract_group_id_arg(cls, event: AstrMessageEvent, command_name: str) -> str:
+        payload = cls._extract_command_payload(event, command_name)
+        if not payload:
+            return ""
+
+        group_id = payload.split()[0].strip()
+        if not group_id.isdigit():
+            return ""
+
+        return group_id
+
+    async def _persist_config(self) -> None:
+        save_fn = getattr(self.config, "save_config", None)
+        if not callable(save_fn):
+            return
+
+        try:
+            result = save_fn()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            logger.error("保存插件配置失败 err=%s", exc)

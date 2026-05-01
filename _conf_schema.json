@@ -1,0 +1,49 @@
+{
+  "enable_welcome": {
+    "description": "启用入群欢迎",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后将不会发送任何入群欢迎消息"
+  },
+  "welcome_group_whitelist": {
+    "description": "入群欢迎群号白名单",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "仅在此白名单中的群发送欢迎消息"
+  },
+  "welcome_template": {
+    "description": "欢迎语模板",
+    "type": "string",
+    "default": "欢迎新成员 {user_id} 加入本群，祝你聊天愉快。",
+    "hint": "可使用占位符: {user_id} 和 {group_id}"
+  },
+  "enable_schedule": {
+    "description": "启用定时消息",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭后不会执行定时推送"
+  },
+  "schedule_group_whitelist": {
+    "description": "定时消息群号白名单",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "仅向这些群发送定时消息"
+  },
+  "schedule_interval_seconds": {
+    "description": "定时发送间隔(秒)",
+    "type": "int",
+    "default": 3600,
+    "hint": "建议 >= 60，插件内部最小限制为 10 秒"
+  },
+  "schedule_message": {
+    "description": "定时发送内容",
+    "type": "text",
+    "default": "群通知：请文明发言，遵守群规。"
+  }
+}

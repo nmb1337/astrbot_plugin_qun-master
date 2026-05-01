@@ -1,0 +1,6 @@
+name: qun_helper # 插件唯一识别名
+display_name: 群欢迎与定时消息 # 用于展示的名字
+desc: 入群欢迎与定时消息插件，支持开关、白名单与异常保护。 # 插件简短描述
+version: v1.0.0 # 插件版本号。格式：v1.1.1 或者 v1.1
+author: YourName # 作者
+repo: https://github.com/yourname/astrbot_plugin_qun_helper # 插件的仓库地址

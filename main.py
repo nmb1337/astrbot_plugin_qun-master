@@ -5,7 +5,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Image
+from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.star import Context, Star, register
 
 
@@ -76,13 +76,19 @@ class QunHelperPlugin(Star):
         if self._is_duplicate_welcome(group_id, user_id, sub_type):
             return
 
-        msg = self._build_welcome_message(group_id=group_id, user_id=user_id)
+        notify_time = self._format_now_str()
+        msg = self._build_welcome_message(
+            group_id=group_id,
+            user_id=user_id,
+            notify_time=notify_time,
+        )
         image_source = self._get_text("welcome_image", "")
         try:
             await self._send_group_notice(
                 event.unified_msg_origin,
                 text=msg,
                 image_source=image_source,
+                at_user_id=user_id,
             )
         except Exception as exc:
             logger.error(
@@ -121,11 +127,13 @@ class QunHelperPlugin(Star):
         if self._is_duplicate_welcome(group_id, user_id, f"decrease:{sub_type}"):
             return
 
+        notify_time = self._format_now_str()
         msg = self._build_leave_message(
             group_id=group_id,
             user_id=user_id,
             operator_id=operator_id,
             sub_type=sub_type,
+            notify_time=notify_time,
         )
         image_source = self._get_text("leave_image", "")
         try:
@@ -133,6 +141,7 @@ class QunHelperPlugin(Star):
                 event.unified_msg_origin,
                 text=msg,
                 image_source=image_source,
+                at_user_id=user_id,
             )
         except Exception as exc:
             logger.error(
@@ -324,16 +333,21 @@ class QunHelperPlugin(Star):
         for key in expired:
             self._recent_welcome_keys.pop(key, None)
 
-    def _build_welcome_message(self, group_id: str, user_id: str) -> str:
+    def _build_welcome_message(
+        self,
+        group_id: str,
+        user_id: str,
+        notify_time: str,
+    ) -> str:
         template = self._get_text(
             "welcome_template",
-            "欢迎新成员 {user_id} 加入本群，祝你聊天愉快。",
+            "欢迎新成员 {user_id} 加入本群，当前时间：{time}。",
         )
         try:
-            return template.format(group_id=group_id, user_id=user_id)
+            return template.format(group_id=group_id, user_id=user_id, time=notify_time)
         except Exception:
             logger.warning("welcome_template 格式错误，已回退到默认欢迎语。")
-            return f"欢迎新成员 {user_id} 加入本群，祝你聊天愉快。"
+            return f"欢迎新成员 {user_id} 加入本群，当前时间：{notify_time}。"
 
     def _build_leave_message(
         self,
@@ -341,10 +355,11 @@ class QunHelperPlugin(Star):
         user_id: str,
         operator_id: str,
         sub_type: str,
+        notify_time: str,
     ) -> str:
         template = self._get_text(
             "leave_template",
-            "成员 {user_id} 已离开本群。",
+            "成员 {user_id} 已离开本群，当前时间：{time}。",
         )
         try:
             return template.format(
@@ -352,26 +367,43 @@ class QunHelperPlugin(Star):
                 user_id=user_id,
                 operator_id=operator_id,
                 sub_type=sub_type,
+                time=notify_time,
             )
         except Exception:
             logger.warning("leave_template 格式错误，已回退到默认退群通知。")
-            return f"成员 {user_id} 已离开本群。"
+            return f"成员 {user_id} 已离开本群，当前时间：{notify_time}。"
 
     async def _send_group_notice(
         self,
         unified_msg_origin: str,
         text: str,
         image_source: str,
+        at_user_id: str = "",
     ) -> None:
-        chain = self._build_notice_chain(text=text, image_source=image_source)
+        chain = self._build_notice_chain(
+            text=text,
+            image_source=image_source,
+            at_user_id=at_user_id,
+        )
         if not chain.chain:
             return
         await self.context.send_message(unified_msg_origin, chain)
 
-    def _build_notice_chain(self, text: str, image_source: str) -> MessageChain:
+    def _build_notice_chain(
+        self,
+        text: str,
+        image_source: str,
+        at_user_id: str = "",
+    ) -> MessageChain:
         chain = MessageChain()
+
+        at_user_id = str(at_user_id or "").strip()
+        if at_user_id:
+            chain.chain.append(At(qq=at_user_id))
+
         if text:
-            chain.message(text)
+            plain_text = text if not at_user_id else f" {text}"
+            chain.chain.append(Plain(text=plain_text))
 
         image_source = str(image_source or "").strip()
         if image_source:
@@ -386,6 +418,10 @@ class QunHelperPlugin(Star):
     def _is_http_url(value: str) -> bool:
         lower = value.lower()
         return lower.startswith("http://") or lower.startswith("https://")
+
+    @staticmethod
+    def _format_now_str() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     @staticmethod
     def _extract_first_image_source(event: AstrMessageEvent) -> str:

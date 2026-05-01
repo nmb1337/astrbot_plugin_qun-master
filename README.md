@@ -11,6 +11,8 @@
 - 支持独立开关：可以单独开启或关闭入群欢迎。
 - 支持群号白名单：只在指定群里触发欢迎或定时消息。
 - 支持入群/退群“图片 + 文字”通知。
+- 入群/退群通知默认带时间，并支持模板中使用 `{time}` 占位符。
+- 入群/退群通知会自动艾特对应成员。
 - 防刷屏：仅在真实入群事件触发欢迎，并做短时间去重。
 - 不调用 LLM：欢迎语和定时消息均为固定模板，不消耗模型 token。
 - 错误保护：发送失败会捕获异常并记录日志，不会导致插件崩溃。
@@ -21,10 +23,10 @@
 
 - `enable_welcome`：是否启用入群欢迎。
 - `welcome_group_whitelist`：允许触发欢迎的群号白名单。
-- `welcome_template`：欢迎语模板，支持 `{user_id}` 和 `{group_id}`。
+- `welcome_template`：欢迎语模板，支持 `{user_id}` `{group_id}` `{time}`。
 - `welcome_image`：入群通知图片（URL 或本地路径）。
 - `enable_leave_notice`：是否启用退群通知。
-- `leave_template`：退群通知模板，支持 `{user_id}` `{group_id}` `{operator_id}` `{sub_type}`。
+- `leave_template`：退群通知模板，支持 `{user_id}` `{group_id}` `{operator_id}` `{sub_type}` `{time}`。
 - `leave_image`：退群通知图片（URL 或本地路径）。
 - `enable_schedule`：是否启用定时发送。
 - `schedule_group_whitelist`：允许接收定时消息的群号白名单。

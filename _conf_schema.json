@@ -18,7 +18,7 @@
     "description": "欢迎语模板",
     "type": "string",
     "default": "欢迎新成员 {user_id} 加入本群，祝你聊天愉快。",
-    "hint": "可使用占位符: {user_id} 和 {group_id}"
+    "hint": "可使用占位符: {user_id} {group_id} {time}"
   },
   "welcome_image": {
     "description": "入群通知图片(URL或本地路径)",
@@ -36,7 +36,7 @@
     "description": "退群通知模板",
     "type": "string",
     "default": "成员 {user_id} 已离开本群。",
-    "hint": "可使用占位符: {user_id} {group_id} {operator_id} {sub_type}"
+    "hint": "可使用占位符: {user_id} {group_id} {operator_id} {sub_type} {time}"
   },
   "leave_image": {
     "description": "退群通知图片(URL或本地路径)",

@@ -20,6 +20,30 @@
     "default": "欢迎新成员 {user_id} 加入本群，祝你聊天愉快。",
     "hint": "可使用占位符: {user_id} 和 {group_id}"
   },
+  "welcome_image": {
+    "description": "入群通知图片(URL或本地路径)",
+    "type": "string",
+    "default": "",
+    "hint": "可留空；填写后会与欢迎文字一起发送"
+  },
+  "enable_leave_notice": {
+    "description": "启用退群通知",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后将不会发送退群通知"
+  },
+  "leave_template": {
+    "description": "退群通知模板",
+    "type": "string",
+    "default": "成员 {user_id} 已离开本群。",
+    "hint": "可使用占位符: {user_id} {group_id} {operator_id} {sub_type}"
+  },
+  "leave_image": {
+    "description": "退群通知图片(URL或本地路径)",
+    "type": "string",
+    "default": "",
+    "hint": "可留空；填写后会与退群文字一起发送"
+  },
   "enable_schedule": {
     "description": "启用定时消息",
     "type": "bool",

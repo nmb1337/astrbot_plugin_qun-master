@@ -5,6 +5,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, register
 
 
@@ -76,14 +77,66 @@ class QunHelperPlugin(Star):
             return
 
         msg = self._build_welcome_message(group_id=group_id, user_id=user_id)
+        image_source = self._get_text("welcome_image", "")
         try:
-            await self.context.send_message(
+            await self._send_group_notice(
                 event.unified_msg_origin,
-                MessageChain().message(msg),
+                text=msg,
+                image_source=image_source,
             )
         except Exception as exc:
             logger.error(
                 "发送入群欢迎失败 group_id=%s user_id=%s err=%s",
+                group_id,
+                user_id,
+                exc,
+            )
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def on_group_member_decrease(self, event: AstrMessageEvent):
+        """仅处理 OneBot v11 的群成员退群通知。"""
+        if not self._get_bool("enable_leave_notice", True):
+            return
+
+        raw = getattr(event.message_obj, "raw_message", None)
+        post_type = self._raw_get(raw, "post_type")
+        notice_type = self._raw_get(raw, "notice_type")
+
+        if post_type != "notice" or notice_type != "group_decrease":
+            return
+
+        group_id = str(self._raw_get(raw, "group_id") or "").strip()
+        user_id = str(self._raw_get(raw, "user_id") or "").strip()
+        operator_id = str(self._raw_get(raw, "operator_id") or "").strip()
+        sub_type = str(self._raw_get(raw, "sub_type") or "").strip()
+
+        if not group_id or not user_id:
+            return
+
+        notice_whitelist = set(self._get_str_list("welcome_group_whitelist"))
+        if group_id not in notice_whitelist:
+            return
+
+        if self._is_duplicate_welcome(group_id, user_id, f"decrease:{sub_type}"):
+            return
+
+        msg = self._build_leave_message(
+            group_id=group_id,
+            user_id=user_id,
+            operator_id=operator_id,
+            sub_type=sub_type,
+        )
+        image_source = self._get_text("leave_image", "")
+        try:
+            await self._send_group_notice(
+                event.unified_msg_origin,
+                text=msg,
+                image_source=image_source,
+            )
+        except Exception as exc:
+            logger.error(
+                "发送退群通知失败 group_id=%s user_id=%s err=%s",
                 group_id,
                 user_id,
                 exc,
@@ -129,6 +182,54 @@ class QunHelperPlugin(Star):
         self.config["welcome_template"] = template
         await self._persist_config()
         yield event.plain_result("已更新欢迎语模板。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("设置入群通知")
+    async def set_join_notice_command(self, event: AstrMessageEvent):
+        """支持在群内通过文字 + 图片设置入群通知。"""
+        text = self._extract_command_payload(event, "设置入群通知")
+        image_source = self._extract_first_image_source(event)
+
+        if not text and not image_source:
+            yield event.plain_result(
+                "用法：/设置入群通知 文本（可附带 1 张图片）"
+            )
+            return
+
+        updated: list[str] = []
+        if text:
+            self.config["welcome_template"] = text
+            updated.append("文字")
+        if image_source:
+            self.config["welcome_image"] = image_source
+            updated.append("图片")
+
+        await self._persist_config()
+        yield event.plain_result("已更新入群通知：" + "、".join(updated))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("设置退群通知")
+    async def set_leave_notice_command(self, event: AstrMessageEvent):
+        """支持在群内通过文字 + 图片设置退群通知。"""
+        text = self._extract_command_payload(event, "设置退群通知")
+        image_source = self._extract_first_image_source(event)
+
+        if not text and not image_source:
+            yield event.plain_result(
+                "用法：/设置退群通知 文本（可附带 1 张图片）"
+            )
+            return
+
+        updated: list[str] = []
+        if text:
+            self.config["leave_template"] = text
+            updated.append("文字")
+        if image_source:
+            self.config["leave_image"] = image_source
+            updated.append("图片")
+
+        await self._persist_config()
+        yield event.plain_result("已更新退群通知：" + "、".join(updated))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("添加白名单")
@@ -233,6 +334,74 @@ class QunHelperPlugin(Star):
         except Exception:
             logger.warning("welcome_template 格式错误，已回退到默认欢迎语。")
             return f"欢迎新成员 {user_id} 加入本群，祝你聊天愉快。"
+
+    def _build_leave_message(
+        self,
+        group_id: str,
+        user_id: str,
+        operator_id: str,
+        sub_type: str,
+    ) -> str:
+        template = self._get_text(
+            "leave_template",
+            "成员 {user_id} 已离开本群。",
+        )
+        try:
+            return template.format(
+                group_id=group_id,
+                user_id=user_id,
+                operator_id=operator_id,
+                sub_type=sub_type,
+            )
+        except Exception:
+            logger.warning("leave_template 格式错误，已回退到默认退群通知。")
+            return f"成员 {user_id} 已离开本群。"
+
+    async def _send_group_notice(
+        self,
+        unified_msg_origin: str,
+        text: str,
+        image_source: str,
+    ) -> None:
+        chain = self._build_notice_chain(text=text, image_source=image_source)
+        if not chain.chain:
+            return
+        await self.context.send_message(unified_msg_origin, chain)
+
+    def _build_notice_chain(self, text: str, image_source: str) -> MessageChain:
+        chain = MessageChain()
+        if text:
+            chain.message(text)
+
+        image_source = str(image_source or "").strip()
+        if image_source:
+            if self._is_http_url(image_source):
+                chain.url_image(image_source)
+            else:
+                chain.file_image(image_source)
+
+        return chain
+
+    @staticmethod
+    def _is_http_url(value: str) -> bool:
+        lower = value.lower()
+        return lower.startswith("http://") or lower.startswith("https://")
+
+    @staticmethod
+    def _extract_first_image_source(event: AstrMessageEvent) -> str:
+        for comp in event.get_messages():
+            if not isinstance(comp, Image):
+                continue
+
+            url = str(getattr(comp, "url", "") or "").strip()
+            if url:
+                return url
+
+            file_path = str(getattr(comp, "file", "") or "").strip()
+            if file_path:
+                return file_path
+
+        return ""
 
     @staticmethod
     def _raw_get(raw: Any, key: str) -> Any:

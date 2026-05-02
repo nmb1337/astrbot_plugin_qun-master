@@ -37,6 +37,9 @@ class QunHelperPlugin(Star):
         self._msg_by_group_user: dict[str, dict[str, int]] = defaultdict(
             lambda: defaultdict(int)
         )
+        self._msg_activity_by_group_user: dict[str, dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
         self._user_name_cache: dict[str, str] = {}
         self._daily_speakers_by_group_day: dict[str, set[str]] = defaultdict(set)
         self._daily_speaker_keep_days = 3
@@ -44,6 +47,9 @@ class QunHelperPlugin(Star):
         # 排行榜 Web 服务
         self._rank_app_runner: web.AppRunner | None = None
         self._rank_site: web.TCPSite | None = None
+
+        # 延时踢人任务
+        self._pending_kick_tasks: set[asyncio.Task] = set()
 
     async def initialize(self):
         self._scheduler_task = asyncio.create_task(self._scheduled_sender_loop())
@@ -53,6 +59,11 @@ class QunHelperPlugin(Star):
     async def terminate(self):
         self._running = False
         await self._stop_rank_server()
+
+        for task in list(self._pending_kick_tasks):
+            if task and not task.done():
+                task.cancel()
+        self._pending_kick_tasks.clear()
 
         if self._scheduler_task and not self._scheduler_task.done():
             self._scheduler_task.cancel()
@@ -83,13 +94,56 @@ class QunHelperPlugin(Star):
             return
 
         user_name = str(event.get_sender_name() or "").strip() or user_id
+        day_key = self._today_key()
+        async with self._stats_lock:
+            # 独立记录群内发言活跃计数，供“观察期发言免踢”逻辑使用。
+            self._msg_activity_by_group_user[group_id][user_id] += 1
+            self._user_name_cache[user_id] = user_name
+            self._daily_speakers_by_group_day[f"{group_id}:{day_key}"].add(user_id)
+            self._cleanup_daily_speaker_cache_locked()
+
+        rank_whitelist = set(self._get_str_list("rank_group_whitelist"))
+        if rank_whitelist and group_id not in rank_whitelist:
+            return
+
         async with self._stats_lock:
             self._msg_total_by_user[user_id] += 1
             self._msg_by_group_user[group_id][user_id] += 1
-            self._user_name_cache[user_id] = user_name
-            day_key = self._today_key()
-            self._daily_speakers_by_group_day[f"{group_id}:{day_key}"].add(user_id)
-            self._cleanup_daily_speaker_cache_locked()
+
+    @filter.command("群发言排行")
+    async def group_rank_command(self, event: AstrMessageEvent):
+        """在群内查看当前群发言排行。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用：/群发言排行 [人数]")
+            return
+
+        rank_whitelist = set(self._get_str_list("rank_group_whitelist"))
+        if rank_whitelist and group_id not in rank_whitelist:
+            yield event.plain_result("当前群未开启发言排行。")
+            return
+
+        payload = self._extract_command_payload(event, "群发言排行")
+        limit = self._extract_first_int(payload)
+        if limit is None:
+            limit = 10
+        limit = max(1, min(limit, 50))
+
+        async with self._stats_lock:
+            group_data = dict(self._msg_by_group_user.get(group_id, {}))
+            names = dict(self._user_name_cache)
+
+        if not group_data:
+            yield event.plain_result("当前群还没有可用的发言统计。")
+            return
+
+        rows = sorted(group_data.items(), key=lambda item: item[1], reverse=True)
+        lines = [f"本群发言排行 TOP {limit}"]
+        for idx, (user_id, count) in enumerate(rows[:limit], start=1):
+            name = names.get(user_id, user_id)
+            lines.append(f"{idx}. {name}({user_id}) - {count}")
+
+        yield event.plain_result("\n".join(lines))
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -322,7 +376,7 @@ class QunHelperPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("踢低等级")
     async def kick_low_level_command(self, event: AstrMessageEvent):
-        """指令踢出低于指定群等级的成员。"""
+        """指令踢出低于指定群等级的成员（10分钟后执行）。"""
         group_id = str(event.get_group_id() or "").strip()
         if not group_id:
             yield event.plain_result("请在群聊中使用：/踢低等级 等级")
@@ -343,8 +397,7 @@ class QunHelperPlugin(Star):
             return
 
         self_id = str(event.get_self_id() or "").strip()
-        kicked_ids: list[str] = []
-        failed_ids: list[str] = []
+        target_ids: list[str] = []
         skipped_admin_cnt = 0
 
         for member in members:
@@ -364,30 +417,55 @@ class QunHelperPlugin(Star):
             if level is None or level >= threshold:
                 continue
 
-            ok = await self._kick_group_member(event, group_id, user_id)
-            if ok:
-                kicked_ids.append(user_id)
-            else:
-                failed_ids.append(user_id)
+            target_ids.append(user_id)
 
-        if not kicked_ids and not failed_ids:
+        if not target_ids:
             yield event.plain_result(
                 f"已检查完成：没有低于 {threshold} 级的可踢成员。"
             )
             return
 
-        lines = [
-            f"踢低等级执行完成（阈值: {threshold}）",
-            f"成功踢出: {len(kicked_ids)} 人",
-            f"失败: {len(failed_ids)} 人",
-            f"跳过管理员/群主: {skipped_admin_cnt} 人",
-        ]
-        if kicked_ids:
-            lines.append("成功ID: " + ", ".join(kicked_ids[:20]))
-        if failed_ids:
-            lines.append("失败ID: " + ", ".join(failed_ids[:20]))
+        delay_seconds = 10 * 60
+        delay_minutes = delay_seconds // 60
 
-        yield event.plain_result("\n".join(lines))
+        warn_text = (
+            f"以下成员群等级低于 {threshold}，"
+            f"将于 {delay_minutes} 分钟后执行移出；"
+            f"若观察期内发言，将免于踢出。"
+        )
+        warn_chain = MessageChain()
+        for uid in target_ids:
+            warn_chain.chain.append(At(qq=uid))
+            warn_chain.chain.append(Plain(text=" "))
+        warn_chain.chain.append(Plain(text=warn_text))
+
+        async with self._stats_lock:
+            activity_baseline = {
+                uid: self._msg_activity_by_group_user.get(group_id, {}).get(uid, 0)
+                for uid in target_ids
+            }
+
+        try:
+            await self.context.send_message(event.unified_msg_origin, warn_chain)
+        except Exception as exc:
+            logger.error("发送踢人预警失败 group_id=%s err=%s", group_id, exc)
+
+        task = asyncio.create_task(
+            self._execute_delayed_kick(
+                unified_msg_origin=event.unified_msg_origin,
+                group_id=group_id,
+                threshold=threshold,
+                target_ids=target_ids,
+                activity_baseline=activity_baseline,
+                delay_seconds=delay_seconds,
+            )
+        )
+        self._track_kick_task(task)
+
+        yield event.plain_result(
+            f"已提醒 {len(target_ids)} 人，{delay_minutes} 分钟后执行踢出。"
+            f"（跳过管理员/群主 {skipped_admin_cnt} 人）"
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("提醒未发言")
@@ -529,34 +607,6 @@ class QunHelperPlugin(Star):
             logger.warning("welcome_template 格式错误，已回退到默认欢迎语。")
             return f"欢迎新成员 {user_id} 加入本群，当前时间：{notify_time}。"
 
-    def _build_kick_notice_message(
-        self,
-        group_id: str,
-        user_id: str,
-        member_level: int,
-        min_level: int,
-        notify_time: str,
-    ) -> str:
-        template = self._get_text(
-            "kick_notice_template",
-            "成员 {user_id} 的群等级 {level} 低于要求 {min_level}，已移出本群。当前时间：{time}。",
-        )
-        try:
-            message = template.format(
-                group_id=group_id,
-                user_id=user_id,
-                level=member_level,
-                min_level=min_level,
-                time=notify_time,
-            )
-            return self._ensure_time_visible(message, notify_time)
-        except Exception:
-            logger.warning("kick_notice_template 格式错误，已回退到默认提示。")
-            return (
-                f"成员 {user_id} 的群等级 {member_level} 低于要求 {min_level}，"
-                f"已移出本群。当前时间：{notify_time}。"
-            )
-
     def _build_leave_message(
         self,
         group_id: str,
@@ -644,58 +694,9 @@ class QunHelperPlugin(Star):
     def _format_now_str() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    async def _try_auto_kick_low_level_member(
-        self,
-        event: AstrMessageEvent,
-        group_id: str,
-        user_id: str,
-    ) -> bool:
-        if not self._get_bool("enable_auto_kick_low_level", False):
-            return False
-
-        target_groups = set(self._get_str_list("kick_group_whitelist"))
-        if group_id not in target_groups:
-            return False
-
-        min_level = self._get_int("kick_min_level", 1)
-        if min_level <= 0:
-            return False
-
-        member_level = await self._get_member_level(event, group_id, user_id)
-        if member_level is None:
-            return False
-
-        if member_level >= min_level:
-            return False
-
-        kicked = await self._kick_group_member(event, group_id, user_id)
-        if not kicked:
-            return False
-
-        if self._get_bool("enable_kick_notice", True):
-            try:
-                notify_time = self._format_now_str()
-                text = self._build_kick_notice_message(
-                    group_id=group_id,
-                    user_id=user_id,
-                    member_level=member_level,
-                    min_level=min_level,
-                    notify_time=notify_time,
-                )
-                await self._send_group_notice(
-                    event.unified_msg_origin,
-                    text=text,
-                    image_source="",
-                    at_user_id=user_id,
-                )
-            except Exception as exc:
-                logger.error("发送踢人提示失败 group_id=%s user_id=%s err=%s", group_id, user_id, exc)
-
-        return True
-
     async def _get_member_level(
         self,
-        event: AstrMessageEvent,
+        event: AstrMessageEvent | None,
         group_id: str,
         user_id: str,
     ) -> int | None:
@@ -714,7 +715,7 @@ class QunHelperPlugin(Star):
 
     async def _kick_group_member(
         self,
-        event: AstrMessageEvent,
+        event: AstrMessageEvent | None,
         group_id: str,
         user_id: str,
     ) -> bool:
@@ -740,11 +741,11 @@ class QunHelperPlugin(Star):
 
     async def _call_aiocqhttp_action(
         self,
-        event: AstrMessageEvent,
+        event: AstrMessageEvent | None,
         action: str,
         **kwargs,
     ) -> Any:
-        bot = getattr(event, "bot", None)
+        bot = getattr(event, "bot", None) if event else None
 
         try:
             if bot and callable(getattr(bot, "call_action", None)):
@@ -770,7 +771,7 @@ class QunHelperPlugin(Star):
 
     @staticmethod
     def _extract_action_data(result: Any) -> Any:
-        if isinstance(result, dict) and isinstance(result.get("data"), dict):
+        if isinstance(result, dict) and "data" in result:
             return result.get("data")
         return result
 
@@ -811,7 +812,7 @@ class QunHelperPlugin(Star):
 
     async def _get_group_member_list(
         self,
-        event: AstrMessageEvent,
+        event: AstrMessageEvent | None,
         group_id: str,
     ) -> list[dict[str, Any]] | None:
         result = await self._call_aiocqhttp_action(
@@ -847,6 +848,89 @@ class QunHelperPlugin(Star):
     def _chunk_list(items: list[str], size: int):
         for i in range(0, len(items), size):
             yield items[i : i + size]
+
+    def _track_kick_task(self, task: asyncio.Task) -> None:
+        self._pending_kick_tasks.add(task)
+
+        def _cleanup(done_task: asyncio.Task) -> None:
+            self._pending_kick_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            try:
+                exc = done_task.exception()
+                if exc:
+                    logger.error("延时踢人任务异常 err=%s", exc)
+            except Exception:
+                pass
+
+        task.add_done_callback(_cleanup)
+
+    async def _execute_delayed_kick(
+        self,
+        unified_msg_origin: str,
+        group_id: str,
+        threshold: int,
+        target_ids: list[str],
+        activity_baseline: dict[str, int],
+        delay_seconds: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(delay_seconds)
+        except asyncio.CancelledError:
+            return
+
+        kicked_ids: list[str] = []
+        failed_ids: list[str] = []
+        recovered_cnt = 0
+        missing_cnt = 0
+        spoke_skip_cnt = 0
+
+        async with self._stats_lock:
+            activity_now = dict(self._msg_activity_by_group_user.get(group_id, {}))
+
+        dedup_ids = list(dict.fromkeys(target_ids))
+        for user_id in dedup_ids:
+            baseline = int(activity_baseline.get(user_id, 0))
+            current = int(activity_now.get(user_id, 0))
+            if current > baseline:
+                spoke_skip_cnt += 1
+                continue
+
+            level = await self._get_member_level(None, group_id, user_id)
+            if level is None:
+                missing_cnt += 1
+                continue
+
+            if level >= threshold:
+                recovered_cnt += 1
+                continue
+
+            ok = await self._kick_group_member(None, group_id, user_id)
+            if ok:
+                kicked_ids.append(user_id)
+            else:
+                failed_ids.append(user_id)
+
+        lines = [
+            f"踢低等级执行完成（阈值: {threshold}）",
+            f"成功踢出: {len(kicked_ids)} 人",
+            f"失败: {len(failed_ids)} 人",
+            f"观察期发言免踢: {spoke_skip_cnt} 人",
+            f"已达标无需踢出: {recovered_cnt} 人",
+            f"未找到成员信息: {missing_cnt} 人",
+        ]
+        if kicked_ids:
+            lines.append("成功ID: " + ", ".join(kicked_ids[:20]))
+        if failed_ids:
+            lines.append("失败ID: " + ", ".join(failed_ids[:20]))
+
+        try:
+            await self.context.send_message(
+                unified_msg_origin,
+                MessageChain().message("\n".join(lines)),
+            )
+        except Exception as exc:
+            logger.error("发送踢人执行结果失败 group_id=%s err=%s", group_id, exc)
 
     async def _start_rank_server(self) -> None:
         if self._rank_app_runner is not None:
@@ -898,9 +982,19 @@ class QunHelperPlugin(Star):
 
     async def _build_rank_snapshot(self) -> dict[str, Any]:
         async with self._stats_lock:
-            total = dict(self._msg_total_by_user)
             by_group = {gid: dict(data) for gid, data in self._msg_by_group_user.items()}
             names = dict(self._user_name_cache)
+
+        rank_whitelist = set(self._get_str_list("rank_group_whitelist"))
+        if rank_whitelist:
+            by_group = {
+                gid: data for gid, data in by_group.items() if gid in rank_whitelist
+            }
+
+        total: dict[str, int] = defaultdict(int)
+        for group_data in by_group.values():
+            for user_id, cnt in group_data.items():
+                total[user_id] += cnt
 
         total_rows = sorted(total.items(), key=lambda item: item[1], reverse=True)
         total_top = [

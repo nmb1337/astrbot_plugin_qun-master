@@ -56,38 +56,20 @@
     "default": 16666,
     "hint": "按需求默认 16666"
   },
-  "enable_auto_kick_low_level": {
-    "description": "启用低群等级自动踢出",
-    "type": "bool",
-    "default": false,
-    "hint": "仅对 kick_group_whitelist 内群生效"
-  },
-  "kick_group_whitelist": {
-    "description": "低群等级踢出群号白名单",
+  "rank_group_whitelist": {
+    "description": "排行榜统计群号白名单",
     "type": "list",
     "items": {
       "type": "string"
     },
     "default": [],
-    "hint": "仅在这些群检测成员等级并执行踢出"
+    "hint": "为空表示统计全部群；填写后仅统计白名单中的群"
   },
   "kick_min_level": {
     "description": "最低允许群等级",
     "type": "int",
     "default": 1,
-    "hint": "成员等级低于该值时自动踢出"
-  },
-  "enable_kick_notice": {
-    "description": "启用踢出提示通知",
-    "type": "bool",
-    "default": true,
-    "hint": "踢出成功后在群内发送提示"
-  },
-  "kick_notice_template": {
-    "description": "踢出提示模板",
-    "type": "string",
-    "default": "成员 {user_id} 的群等级 {level} 低于要求 {min_level}，已移出本群。当前时间：{time}。",
-    "hint": "可使用占位符: {user_id} {group_id} {level} {min_level} {time}"
+    "hint": "成员等级低于该值时，执行 /踢低等级 未带参数时会使用该值"
   },
   "silent_reminder_text": {
     "description": "未发言提醒默认话术",

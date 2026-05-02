@@ -513,27 +513,48 @@ class QunHelperPlugin(Star):
             )
             return
 
-        kicked_ids: list[str] = []
-        failed_ids: list[str] = []
-        for user_id in list(dict.fromkeys(target_ids)):
-            ok = await self._kick_group_member(event, group_id, user_id)
-            if ok:
-                kicked_ids.append(user_id)
-            else:
-                failed_ids.append(user_id)
+        delay_minutes = max(1, self._get_int("kick_inactive_delay_minutes", 10))
+        delay_seconds = delay_minutes * 60
 
-        lines = [
-            f"踢未发言执行完成（范围: 最近 {days} 天）",
-            f"成功踢出: {len(kicked_ids)} 人",
-            f"失败: {len(failed_ids)} 人",
-            f"跳过管理员/群主: {skipped_admin_cnt} 人",
-            f"跳过白名单: {skipped_whitelist_cnt} 人",
-        ]
-        if kicked_ids:
-            lines.append("成功ID: " + ", ".join(kicked_ids[:20]))
-        if failed_ids:
-            lines.append("失败ID: " + ", ".join(failed_ids[:20]))
-        yield event.plain_result("\n".join(lines))
+        warn_text = (
+            f"以下成员最近 {days} 天未发言，"
+            f"将于 {delay_minutes} 分钟后执行移出；"
+            f"若观察期内发言，将免于踢出。"
+        )
+        warn_chain = MessageChain()
+        for uid in target_ids:
+            warn_chain.chain.append(At(qq=uid))
+            warn_chain.chain.append(Plain(text=" "))
+        warn_chain.chain.append(Plain(text=warn_text))
+
+        async with self._stats_lock:
+            activity_baseline = {
+                uid: self._msg_activity_by_group_user.get(group_id, {}).get(uid, 0)
+                for uid in target_ids
+            }
+
+        try:
+            await self.context.send_message(event.unified_msg_origin, warn_chain)
+        except Exception as exc:
+            logger.error("发送踢未发言预警失败 group_id=%s err=%s", group_id, exc)
+
+        task = asyncio.create_task(
+            self._execute_delayed_inactive_kick(
+                unified_msg_origin=event.unified_msg_origin,
+                group_id=group_id,
+                days=days,
+                target_ids=target_ids,
+                activity_baseline=activity_baseline,
+                delay_seconds=delay_seconds,
+            )
+        )
+        self._track_kick_task(task)
+
+        yield event.plain_result(
+            f"已提醒 {len(target_ids)} 人，{delay_minutes} 分钟后执行踢出。"
+            f"（范围: 最近 {days} 天，跳过管理员/群主 {skipped_admin_cnt} 人，"
+            f"白名单 {skipped_whitelist_cnt} 人）"
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("踢低等级")
@@ -1244,6 +1265,66 @@ class QunHelperPlugin(Star):
             )
         except Exception as exc:
             logger.error("发送踢人执行结果失败 group_id=%s err=%s", group_id, exc)
+
+    async def _execute_delayed_inactive_kick(
+        self,
+        unified_msg_origin: str,
+        group_id: str,
+        days: int,
+        target_ids: list[str],
+        activity_baseline: dict[str, int],
+        delay_seconds: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(delay_seconds)
+        except asyncio.CancelledError:
+            return
+
+        kicked_ids: list[str] = []
+        failed_ids: list[str] = []
+        spoke_skip_cnt = 0
+        whitelist_skip_cnt = 0
+
+        async with self._stats_lock:
+            activity_now = dict(self._msg_activity_by_group_user.get(group_id, {}))
+
+        kick_user_whitelist = set(self._get_str_list("kick_user_whitelist"))
+        for user_id in list(dict.fromkeys(target_ids)):
+            if user_id in kick_user_whitelist:
+                whitelist_skip_cnt += 1
+                continue
+
+            baseline = int(activity_baseline.get(user_id, 0))
+            current = int(activity_now.get(user_id, 0))
+            if current > baseline:
+                spoke_skip_cnt += 1
+                continue
+
+            ok = await self._kick_group_member(None, group_id, user_id)
+            if ok:
+                kicked_ids.append(user_id)
+            else:
+                failed_ids.append(user_id)
+
+        lines = [
+            f"踢未发言执行完成（范围: 最近 {days} 天）",
+            f"成功踢出: {len(kicked_ids)} 人",
+            f"失败: {len(failed_ids)} 人",
+            f"白名单免踢: {whitelist_skip_cnt} 人",
+            f"观察期发言免踢: {spoke_skip_cnt} 人",
+        ]
+        if kicked_ids:
+            lines.append("成功ID: " + ", ".join(kicked_ids[:20]))
+        if failed_ids:
+            lines.append("失败ID: " + ", ".join(failed_ids[:20]))
+
+        try:
+            await self.context.send_message(
+                unified_msg_origin,
+                MessageChain().message("\n".join(lines)),
+            )
+        except Exception as exc:
+            logger.error("发送踢未发言执行结果失败 group_id=%s err=%s", group_id, exc)
 
     async def _start_rank_server(self) -> None:
         if self._rank_app_runner is not None:

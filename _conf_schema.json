@@ -80,6 +80,12 @@
     "default": [],
     "hint": "白名单中的QQ号不会被 /踢低等级 与 /踢未发言 踢出"
   },
+  "kick_inactive_delay_minutes": {
+    "description": "踢未发言冷却分钟数",
+    "type": "int",
+    "default": 10,
+    "hint": "执行 /踢未发言 后，等待该分钟数再实际踢出；观察期内发言可免踢"
+  },
   "speaker_stats_keep_days": {
     "description": "发言统计保留天数",
     "type": "int",

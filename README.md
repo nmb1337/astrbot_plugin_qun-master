@@ -51,6 +51,7 @@
 - `rank_group_whitelist`：排行榜统计群白名单；为空时统计全部群。
 - `kick_min_level`：`/踢低等级` 未填写等级参数时的默认等级阈值。
 - `kick_user_whitelist`：踢人用户白名单（QQ号）；白名单成员不会被 `/踢低等级` 踢出。
+- `kick_inactive_delay_minutes`：`/踢未发言` 的冷却分钟数（默认 `10`）。
 - `speaker_stats_keep_days`：发言统计保留天数（用于 `/踢未发言` 统计窗口）。
 - `enable_silent_reminder_schedule`：是否开启定时未发言提醒。
 - `silent_reminder_group_whitelist`：定时未发言提醒群白名单。
@@ -86,7 +87,7 @@
 - `/移除白名单 群号`：将群号移出入群欢迎白名单。
 - `/设置未发言提醒时间 HH:MM`：设置并开启定时未发言提醒（自动将当前群加入提醒白名单）。
 - `/踢低等级 等级`：先艾特提醒目标成员，10 分钟后再执行踢出；若观察期内发言则不踢；`kick_user_whitelist` 内成员始终不踢。
-- `/踢未发言 天数`：踢出最近指定天数内未发言成员（`kick_user_whitelist` 白名单成员不踢）。
+- `/踢未发言 天数`：先艾特提醒目标成员，按 `kick_inactive_delay_minutes` 冷却后再执行踢出；若观察期内发言则不踢（`kick_user_whitelist` 白名单成员始终不踢）。
 - `/艾特管理员 附加内容`：艾特群内全部管理员/群主并附带文本。
 - `/提醒未发言 自定义话术`：艾特今天未发言成员并附带话术。
 

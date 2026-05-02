@@ -822,14 +822,10 @@ class QunHelperPlugin(Star):
                 user_id=user_id,
                 time=notify_time,
             )
-            plain = self._ensure_time_visible(message, notify_time)
-            return self._to_notice_box("入群欢迎", plain)
+            return self._ensure_time_visible(message, notify_time)
         except Exception:
             logger.warning("welcome_template 格式错误，已回退到默认欢迎语。")
-            return self._to_notice_box(
-                "入群欢迎",
-                f"欢迎新成员 {user_id} 加入本群。\n当前时间：{notify_time}。",
-            )
+            return f"欢迎新成员 {user_id} 加入本群。\n当前时间：{notify_time}。"
 
     def _build_leave_message(
         self,
@@ -851,14 +847,10 @@ class QunHelperPlugin(Star):
                 sub_type=sub_type,
                 time=notify_time,
             )
-            plain = self._ensure_time_visible(message, notify_time)
-            return self._to_notice_box("退群通知", plain)
+            return self._ensure_time_visible(message, notify_time)
         except Exception:
             logger.warning("leave_template 格式错误，已回退到默认退群通知。")
-            return self._to_notice_box(
-                "退群通知",
-                f"成员 {user_id} 已离开本群。\n当前时间：{notify_time}。",
-            )
+            return f"成员 {user_id} 已离开本群。\n当前时间：{notify_time}。"
 
     async def _send_group_notice(
         self,
@@ -931,20 +923,6 @@ class QunHelperPlugin(Star):
         while lines and not lines[-1].strip():
             lines.pop()
         return "\n".join(lines)
-
-    def _to_notice_box(self, title: str, content: str) -> str:
-        body = self._normalize_notice_text(content)
-        lines = body.split("\n") if body else [" "]
-
-        result = [
-            "┏━━━━━━━━━━━━━━━━━━━━",
-            f"┃ {title}",
-            "┣━━━━━━━━━━━━━━━━━━━━",
-        ]
-        for line in lines:
-            result.append(f"┃ {line}")
-        result.append("┗━━━━━━━━━━━━━━━━━━━━")
-        return "\n".join(result)
 
     @staticmethod
     def _format_now_str() -> str:

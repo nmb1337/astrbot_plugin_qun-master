@@ -78,7 +78,34 @@
       "type": "string"
     },
     "default": [],
-    "hint": "白名单中的QQ号不会被 /踢低等级 踢出"
+    "hint": "白名单中的QQ号不会被 /踢低等级 与 /踢未发言 踢出"
+  },
+  "speaker_stats_keep_days": {
+    "description": "发言统计保留天数",
+    "type": "int",
+    "default": 30,
+    "hint": "用于未发言提醒和 /踢未发言 的统计窗口上限"
+  },
+  "enable_silent_reminder_schedule": {
+    "description": "启用定时未发言提醒",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会在指定时间自动提醒当日未发言成员"
+  },
+  "silent_reminder_group_whitelist": {
+    "description": "定时未发言提醒群号白名单",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "仅在这些群执行定时未发言提醒"
+  },
+  "silent_reminder_daily_time": {
+    "description": "定时未发言提醒时间(HH:MM)",
+    "type": "string",
+    "default": "21:00",
+    "hint": "24小时制，例如 21:00"
   },
   "silent_reminder_text": {
     "description": "未发言提醒默认话术",
@@ -111,6 +138,12 @@
     "type": "string",
     "default": "09:00",
     "hint": "24 小时制，例如 09:00 或 21:30"
+  },
+  "schedule_at_all": {
+    "description": "定时消息艾特全体成员",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后发送定时消息时会附带 @全体成员"
   },
   "schedule_message": {
     "description": "定时发送内容",

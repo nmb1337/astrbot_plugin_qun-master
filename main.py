@@ -1,7 +1,7 @@
 import asyncio
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from typing import Any
 
@@ -30,6 +30,7 @@ class QunHelperPlugin(Star):
 
         # 防止定时消息在同一天内重复发送
         self._last_schedule_fire_key: str | None = None
+        self._last_silent_reminder_fire_key: str | None = None
 
         # 消息排行榜统计
         self._stats_lock = asyncio.Lock()
@@ -42,7 +43,10 @@ class QunHelperPlugin(Star):
         )
         self._user_name_cache: dict[str, str] = {}
         self._daily_speakers_by_group_day: dict[str, set[str]] = defaultdict(set)
-        self._daily_speaker_keep_days = 3
+        self._daily_speaker_keep_days = max(
+            1,
+            self._get_int("speaker_stats_keep_days", 30),
+        )
 
         # 排行榜 Web 服务
         self._rank_app_runner: web.AppRunner | None = None
@@ -374,6 +378,164 @@ class QunHelperPlugin(Star):
         yield event.plain_result(f"已移除白名单群号：{group_id}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("设置未发言提醒时间")
+    async def set_silent_reminder_time_command(self, event: AstrMessageEvent):
+        payload = self._extract_command_payload(event, "设置未发言提醒时间")
+        parsed = self._parse_daily_time(payload)
+        if parsed is None:
+            yield event.plain_result("用法：/设置未发言提醒时间 HH:MM（24小时制）")
+            return
+
+        hour, minute = parsed
+        time_text = f"{hour:02d}:{minute:02d}"
+        self.config["silent_reminder_daily_time"] = time_text
+        self.config["enable_silent_reminder_schedule"] = True
+
+        group_id = str(event.get_group_id() or "").strip()
+        added_group = False
+        if group_id:
+            groups = self._get_str_list("silent_reminder_group_whitelist")
+            if group_id not in groups:
+                groups.append(group_id)
+                self.config["silent_reminder_group_whitelist"] = groups
+                added_group = True
+
+        await self._persist_config()
+        tip = "并已将当前群加入定时提醒白名单。" if added_group else ""
+        yield event.plain_result(
+            f"已设置未发言定时提醒时间为 {time_text}，并已开启定时提醒功能。{tip}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("艾特管理员")
+    async def mention_admins_command(self, event: AstrMessageEvent):
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用：/艾特管理员 [附加内容]")
+            return
+
+        members = await self._get_group_member_list(event, group_id)
+        if members is None:
+            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
+            return
+
+        self_id = str(event.get_self_id() or "").strip()
+        admin_ids: list[str] = []
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            user_id = str(member.get("user_id") or "").strip()
+            if not user_id or user_id == self_id:
+                continue
+            role = str(member.get("role") or "member").lower()
+            if role in {"owner", "admin"}:
+                admin_ids.append(user_id)
+
+        admin_ids = list(dict.fromkeys(admin_ids))
+        if not admin_ids:
+            yield event.plain_result("当前群未找到可艾特的管理员。")
+            return
+
+        payload = self._extract_command_payload(event, "艾特管理员")
+        tail_text = payload if payload else "请管理员关注处理。"
+
+        chain = MessageChain()
+        for uid in admin_ids:
+            chain.chain.append(At(qq=uid))
+            chain.chain.append(Plain(text=" "))
+        chain.chain.append(Plain(text=tail_text))
+
+        try:
+            await self.context.send_message(event.unified_msg_origin, chain)
+            yield event.plain_result(f"已艾特 {len(admin_ids)} 位管理员。")
+        except Exception as exc:
+            logger.error("艾特管理员发送失败 group_id=%s err=%s", group_id, exc)
+            yield event.plain_result("发送失败，请检查机器人发言权限。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("踢未发言")
+    async def kick_inactive_members_command(self, event: AstrMessageEvent):
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用：/踢未发言 天数")
+            return
+
+        payload = self._extract_command_payload(event, "踢未发言")
+        days = self._extract_first_int(payload)
+        if days is None or days <= 0:
+            yield event.plain_result("用法：/踢未发言 天数（例如 /踢未发言 3）")
+            return
+
+        keep_days = max(1, self._get_int("speaker_stats_keep_days", self._daily_speaker_keep_days))
+        if days > keep_days:
+            yield event.plain_result(
+                f"当前仅保留最近 {keep_days} 天发言记录，请先调大 speaker_stats_keep_days。"
+            )
+            return
+
+        members = await self._get_group_member_list(event, group_id)
+        if members is None:
+            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
+            return
+
+        active_ids = await self._collect_recent_speakers(group_id, days)
+        self_id = str(event.get_self_id() or "").strip()
+        kick_user_whitelist = set(self._get_str_list("kick_user_whitelist"))
+
+        target_ids: list[str] = []
+        skipped_admin_cnt = 0
+        skipped_whitelist_cnt = 0
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+
+            user_id = str(member.get("user_id") or "").strip()
+            if not user_id or user_id == self_id:
+                continue
+            if user_id in kick_user_whitelist:
+                skipped_whitelist_cnt += 1
+                continue
+
+            role = str(member.get("role") or "member").lower()
+            if role in {"owner", "admin"}:
+                skipped_admin_cnt += 1
+                continue
+
+            if user_id in active_ids:
+                continue
+
+            target_ids.append(user_id)
+
+        if not target_ids:
+            yield event.plain_result(
+                f"已检查完成：最近 {days} 天内所有可处理成员均有发言。"
+                f"（跳过管理员/群主 {skipped_admin_cnt} 人，白名单 {skipped_whitelist_cnt} 人）"
+            )
+            return
+
+        kicked_ids: list[str] = []
+        failed_ids: list[str] = []
+        for user_id in list(dict.fromkeys(target_ids)):
+            ok = await self._kick_group_member(event, group_id, user_id)
+            if ok:
+                kicked_ids.append(user_id)
+            else:
+                failed_ids.append(user_id)
+
+        lines = [
+            f"踢未发言执行完成（范围: 最近 {days} 天）",
+            f"成功踢出: {len(kicked_ids)} 人",
+            f"失败: {len(failed_ids)} 人",
+            f"跳过管理员/群主: {skipped_admin_cnt} 人",
+            f"跳过白名单: {skipped_whitelist_cnt} 人",
+        ]
+        if kicked_ids:
+            lines.append("成功ID: " + ", ".join(kicked_ids[:20]))
+        if failed_ids:
+            lines.append("失败ID: " + ", ".join(failed_ids[:20]))
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("踢低等级")
     async def kick_low_level_command(self, event: AstrMessageEvent):
         """指令踢出低于指定群等级的成员（10分钟后执行）。"""
@@ -483,94 +645,124 @@ class QunHelperPlugin(Star):
             yield event.plain_result("请在群聊中使用：/提醒未发言 自定义话术")
             return
 
-        members = await self._get_group_member_list(event, group_id)
-        if members is None:
-            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
-            return
-
         custom_text = self._extract_command_payload(event, "提醒未发言")
         remind_text = custom_text or self._get_text(
             "silent_reminder_text",
             "今天还没发言，记得来冒个泡哦~",
         )
-        batch_size = max(1, self._get_int("silent_reminder_batch_size", 20))
-
-        today_key = self._today_key()
         self_id = str(event.get_self_id() or "").strip()
         sender_id = str(event.get_sender_id() or "").strip()
-        async with self._stats_lock:
-            spoken = set(self._daily_speakers_by_group_day.get(f"{group_id}:{today_key}", set()))
-            if sender_id:
-                spoken.add(sender_id)
+        result = await self._send_silent_reminder_for_group(
+            event=event,
+            unified_msg_origin=event.unified_msg_origin,
+            group_id=group_id,
+            remind_text=remind_text,
+            sender_id=sender_id,
+            self_id=self_id,
+        )
 
-        silent_ids: list[str] = []
-        for member in members:
-            if not isinstance(member, dict):
-                continue
-            user_id = str(member.get("user_id") or "").strip()
-            if not user_id or user_id == self_id:
-                continue
-            if user_id in spoken:
-                continue
-            silent_ids.append(user_id)
+        if result is None:
+            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
+            return
 
-        if not silent_ids:
+        silent_total, reminded_cnt = result
+        if silent_total <= 0:
             yield event.plain_result("今天全员都发言了，无需提醒。")
             return
 
-        reminded_cnt = 0
-        for uid_chunk in self._chunk_list(silent_ids, batch_size):
-            chain = MessageChain()
-            for uid in uid_chunk:
-                chain.chain.append(At(qq=uid))
-                chain.chain.append(Plain(text=" "))
-            chain.chain.append(Plain(text=remind_text))
-
-            try:
-                await self.context.send_message(event.unified_msg_origin, chain)
-                reminded_cnt += len(uid_chunk)
-            except Exception as exc:
-                logger.error("提醒未发言发送失败 group_id=%s err=%s", group_id, exc)
-
         yield event.plain_result(
-            f"提醒完成：未发言 {len(silent_ids)} 人，已发送提醒 {reminded_cnt} 人。"
+            f"提醒完成：未发言 {silent_total} 人，已发送提醒 {reminded_cnt} 人。"
         )
 
     async def _scheduled_sender_loop(self):
         while self._running:
             await asyncio.sleep(15)
 
-            if not self._get_bool("enable_schedule", False):
+            await self._process_schedule_message()
+            await self._process_schedule_silent_reminder()
+
+    async def _process_schedule_message(self) -> None:
+        if not self._get_bool("enable_schedule", False):
+            return
+
+        should_send, fire_key = self._should_fire_daily_schedule()
+        if not should_send:
+            return
+
+        self._last_schedule_fire_key = fire_key
+        groups = self._get_str_list("schedule_group_whitelist")
+        msg = self._get_text("schedule_message", "群通知：请文明发言，遵守群规。")
+        if not groups or not msg:
+            return
+
+        at_all = self._get_bool("schedule_at_all", True)
+        for group_id in groups:
+            umo = self._group_umo_cache.get(group_id)
+            if not umo:
+                logger.warning(
+                    "定时消息跳过，未找到群会话缓存 group_id=%s。请先让该群产生一条消息。",
+                    group_id,
+                )
                 continue
 
-            should_send, fire_key = self._should_fire_daily_schedule()
-            if not should_send:
-                continue
-
-            self._last_schedule_fire_key = fire_key
-
-            groups = self._get_str_list("schedule_group_whitelist")
-            msg = self._get_text("schedule_message", "群通知：请文明发言，遵守群规。")
-            if not groups or not msg:
-                continue
-
-            for group_id in groups:
-                umo = self._group_umo_cache.get(group_id)
-                if not umo:
-                    logger.warning(
-                        "定时消息跳过，未找到群会话缓存 group_id=%s。请先让该群产生一条消息。",
-                        group_id,
-                    )
-                    continue
-
-                try:
+            try:
+                if at_all:
+                    chain = MessageChain()
+                    chain.chain.append(At(qq="all"))
+                    chain.chain.append(Plain(text=f" {msg}"))
+                    await self.context.send_message(umo, chain)
+                else:
                     await self.context.send_message(umo, MessageChain().message(msg))
-                except Exception as exc:
-                    logger.error(
-                        "发送定时消息失败 group_id=%s err=%s",
-                        group_id,
-                        exc,
-                    )
+            except Exception as exc:
+                logger.error(
+                    "发送定时消息失败 group_id=%s err=%s",
+                    group_id,
+                    exc,
+                )
+
+    async def _process_schedule_silent_reminder(self) -> None:
+        if not self._get_bool("enable_silent_reminder_schedule", False):
+            return
+
+        should_send, fire_key = self._should_fire_silent_reminder_schedule()
+        if not should_send:
+            return
+
+        self._last_silent_reminder_fire_key = fire_key
+        groups = self._get_str_list("silent_reminder_group_whitelist")
+        if not groups:
+            return
+
+        remind_text = self._get_text(
+            "silent_reminder_text",
+            "今天还没发言，记得来冒个泡哦~",
+        )
+        for group_id in groups:
+            umo = self._group_umo_cache.get(group_id)
+            if not umo:
+                logger.warning(
+                    "定时未发言提醒跳过，未找到群会话缓存 group_id=%s。请先让该群产生一条消息。",
+                    group_id,
+                )
+                continue
+
+            result = await self._send_silent_reminder_for_group(
+                event=None,
+                unified_msg_origin=umo,
+                group_id=group_id,
+                remind_text=remind_text,
+            )
+            if result is None:
+                logger.error("定时未发言提醒失败，无法获取成员列表 group_id=%s", group_id)
+                continue
+
+            silent_total, reminded_cnt = result
+            logger.info(
+                "定时未发言提醒完成 group_id=%s silent=%s reminded=%s",
+                group_id,
+                silent_total,
+                reminded_cnt,
+            )
 
     def _is_duplicate_welcome(self, group_id: str, user_id: str, sub_type: str) -> bool:
         now = time.time()
@@ -609,10 +801,14 @@ class QunHelperPlugin(Star):
                 user_id=user_id,
                 time=notify_time,
             )
-            return self._ensure_time_visible(message, notify_time)
+            plain = self._ensure_time_visible(message, notify_time)
+            return self._to_notice_box("入群欢迎", plain)
         except Exception:
             logger.warning("welcome_template 格式错误，已回退到默认欢迎语。")
-            return f"欢迎新成员 {user_id} 加入本群，当前时间：{notify_time}。"
+            return self._to_notice_box(
+                "入群欢迎",
+                f"欢迎新成员 {user_id} 加入本群。\n当前时间：{notify_time}。",
+            )
 
     def _build_leave_message(
         self,
@@ -634,10 +830,14 @@ class QunHelperPlugin(Star):
                 sub_type=sub_type,
                 time=notify_time,
             )
-            return self._ensure_time_visible(message, notify_time)
+            plain = self._ensure_time_visible(message, notify_time)
+            return self._to_notice_box("退群通知", plain)
         except Exception:
             logger.warning("leave_template 格式错误，已回退到默认退群通知。")
-            return f"成员 {user_id} 已离开本群，当前时间：{notify_time}。"
+            return self._to_notice_box(
+                "退群通知",
+                f"成员 {user_id} 已离开本群。\n当前时间：{notify_time}。",
+            )
 
     async def _send_group_notice(
         self,
@@ -687,15 +887,43 @@ class QunHelperPlugin(Star):
 
     @staticmethod
     def _ensure_time_visible(message: str, notify_time: str) -> str:
-        text = str(message or "").strip()
+        text = QunHelperPlugin._normalize_notice_text(str(message or ""))
         if not text:
             return f"当前时间：{notify_time}"
 
         # 兼容历史模板：如果模板未包含时间占位符，统一在末尾补充时间
         if notify_time not in text:
-            return f"{text} 当前时间：{notify_time}"
+            return f"{text}\n当前时间：{notify_time}"
 
         return text
+
+    @staticmethod
+    def _normalize_notice_text(raw_text: str) -> str:
+        text = str(raw_text or "")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        # 兼容用户在配置中输入字面量 \n / \r\n
+        text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+
+        lines = [line.rstrip() for line in text.split("\n")]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines)
+
+    def _to_notice_box(self, title: str, content: str) -> str:
+        body = self._normalize_notice_text(content)
+        lines = body.split("\n") if body else [" "]
+
+        result = [
+            "┏━━━━━━━━━━━━━━━━━━━━",
+            f"┃ {title}",
+            "┣━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for line in lines:
+            result.append(f"┃ {line}")
+        result.append("┗━━━━━━━━━━━━━━━━━━━━")
+        return "\n".join(result)
 
     @staticmethod
     def _format_now_str() -> str:
@@ -837,6 +1065,10 @@ class QunHelperPlugin(Star):
         return datetime.now().date().isoformat()
 
     def _cleanup_daily_speaker_cache_locked(self) -> None:
+        self._daily_speaker_keep_days = max(
+            1,
+            self._get_int("speaker_stats_keep_days", self._daily_speaker_keep_days),
+        )
         today = datetime.now().date()
         expired_keys: list[str] = []
         for key in self._daily_speakers_by_group_day.keys():
@@ -855,6 +1087,72 @@ class QunHelperPlugin(Star):
     def _chunk_list(items: list[str], size: int):
         for i in range(0, len(items), size):
             yield items[i : i + size]
+
+    async def _send_silent_reminder_for_group(
+        self,
+        event: AstrMessageEvent | None,
+        unified_msg_origin: str,
+        group_id: str,
+        remind_text: str,
+        sender_id: str = "",
+        self_id: str = "",
+    ) -> tuple[int, int] | None:
+        members = await self._get_group_member_list(event, group_id)
+        if members is None:
+            return None
+
+        today_key = self._today_key()
+        async with self._stats_lock:
+            spoken = set(self._daily_speakers_by_group_day.get(f"{group_id}:{today_key}", set()))
+            if sender_id:
+                spoken.add(sender_id)
+
+        silent_ids: list[str] = []
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            user_id = str(member.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            if self_id and user_id == self_id:
+                continue
+            if user_id in spoken:
+                continue
+            silent_ids.append(user_id)
+
+        if not silent_ids:
+            return 0, 0
+
+        batch_size = max(1, self._get_int("silent_reminder_batch_size", 20))
+        reminded_cnt = 0
+        for uid_chunk in self._chunk_list(silent_ids, batch_size):
+            chain = MessageChain()
+            for uid in uid_chunk:
+                chain.chain.append(At(qq=uid))
+                chain.chain.append(Plain(text=" "))
+            chain.chain.append(Plain(text=remind_text))
+
+            try:
+                await self.context.send_message(unified_msg_origin, chain)
+                reminded_cnt += len(uid_chunk)
+            except Exception as exc:
+                logger.error("提醒未发言发送失败 group_id=%s err=%s", group_id, exc)
+
+        return len(silent_ids), reminded_cnt
+
+    async def _collect_recent_speakers(self, group_id: str, days: int) -> set[str]:
+        if days <= 0:
+            return set()
+
+        keys = [
+            f"{group_id}:{(datetime.now().date() - timedelta(days=offset)).isoformat()}"
+            for offset in range(days)
+        ]
+        async with self._stats_lock:
+            result: set[str] = set()
+            for key in keys:
+                result.update(self._daily_speakers_by_group_day.get(key, set()))
+            return result
 
     def _track_kick_task(self, task: asyncio.Task) -> None:
         self._pending_kick_tasks.add(task)
@@ -1177,6 +1475,24 @@ class QunHelperPlugin(Star):
         fire_key = f"{now.date().isoformat()}-{hour:02d}:{minute:02d}"
 
         if self._last_schedule_fire_key == fire_key:
+            return False, fire_key
+
+        if now.hour == hour and now.minute == minute:
+            return True, fire_key
+
+        return False, fire_key
+
+    def _should_fire_silent_reminder_schedule(self) -> tuple[bool, str]:
+        schedule_time = self._get_text("silent_reminder_daily_time", "21:00")
+        parsed = self._parse_daily_time(schedule_time)
+        if parsed is None:
+            parsed = (21, 0)
+
+        now = datetime.now()
+        hour, minute = parsed
+        fire_key = f"{now.date().isoformat()}-{hour:02d}:{minute:02d}"
+
+        if self._last_silent_reminder_fire_key == fire_key:
             return False, fire_key
 
         if now.hour == hour and now.minute == minute:

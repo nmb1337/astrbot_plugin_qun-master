@@ -71,6 +71,15 @@
     "default": 1,
     "hint": "成员等级低于该值时，执行 /踢低等级 未带参数时会使用该值"
   },
+  "kick_user_whitelist": {
+    "description": "踢人用户白名单",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "白名单中的QQ号不会被 /踢低等级 踢出"
+  },
   "silent_reminder_text": {
     "description": "未发言提醒默认话术",
     "type": "string",

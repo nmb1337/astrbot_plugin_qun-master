@@ -397,8 +397,10 @@ class QunHelperPlugin(Star):
             return
 
         self_id = str(event.get_self_id() or "").strip()
+        kick_user_whitelist = set(self._get_str_list("kick_user_whitelist"))
         target_ids: list[str] = []
         skipped_admin_cnt = 0
+        skipped_whitelist_cnt = 0
 
         for member in members:
             if not isinstance(member, dict):
@@ -406,6 +408,10 @@ class QunHelperPlugin(Star):
 
             user_id = str(member.get("user_id") or "").strip()
             if not user_id or user_id == self_id:
+                continue
+
+            if user_id in kick_user_whitelist:
+                skipped_whitelist_cnt += 1
                 continue
 
             role = str(member.get("role") or "member").lower()
@@ -464,7 +470,8 @@ class QunHelperPlugin(Star):
 
         yield event.plain_result(
             f"已提醒 {len(target_ids)} 人，{delay_minutes} 分钟后执行踢出。"
-            f"（跳过管理员/群主 {skipped_admin_cnt} 人）"
+            f"（跳过管理员/群主 {skipped_admin_cnt} 人，"
+            f"白名单 {skipped_whitelist_cnt} 人）"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -884,12 +891,19 @@ class QunHelperPlugin(Star):
         recovered_cnt = 0
         missing_cnt = 0
         spoke_skip_cnt = 0
+        whitelist_skip_cnt = 0
 
         async with self._stats_lock:
             activity_now = dict(self._msg_activity_by_group_user.get(group_id, {}))
 
+        kick_user_whitelist = set(self._get_str_list("kick_user_whitelist"))
+
         dedup_ids = list(dict.fromkeys(target_ids))
         for user_id in dedup_ids:
+            if user_id in kick_user_whitelist:
+                whitelist_skip_cnt += 1
+                continue
+
             baseline = int(activity_baseline.get(user_id, 0))
             current = int(activity_now.get(user_id, 0))
             if current > baseline:
@@ -915,6 +929,7 @@ class QunHelperPlugin(Star):
             f"踢低等级执行完成（阈值: {threshold}）",
             f"成功踢出: {len(kicked_ids)} 人",
             f"失败: {len(failed_ids)} 人",
+            f"白名单免踢: {whitelist_skip_cnt} 人",
             f"观察期发言免踢: {spoke_skip_cnt} 人",
             f"已达标无需踢出: {recovered_cnt} 人",
             f"未找到成员信息: {missing_cnt} 人",

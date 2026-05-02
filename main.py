@@ -1,8 +1,11 @@
 import asyncio
 import time
+from collections import defaultdict
 from datetime import datetime
+from html import escape
 from typing import Any
 
+from aiohttp import web
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Image, Plain
@@ -28,11 +31,29 @@ class QunHelperPlugin(Star):
         # 防止定时消息在同一天内重复发送
         self._last_schedule_fire_key: str | None = None
 
+        # 消息排行榜统计
+        self._stats_lock = asyncio.Lock()
+        self._msg_total_by_user: dict[str, int] = defaultdict(int)
+        self._msg_by_group_user: dict[str, dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+        self._user_name_cache: dict[str, str] = {}
+        self._daily_speakers_by_group_day: dict[str, set[str]] = defaultdict(set)
+        self._daily_speaker_keep_days = 3
+
+        # 排行榜 Web 服务
+        self._rank_app_runner: web.AppRunner | None = None
+        self._rank_site: web.TCPSite | None = None
+
     async def initialize(self):
         self._scheduler_task = asyncio.create_task(self._scheduled_sender_loop())
+        if self._get_bool("enable_rank_server", True):
+            await self._start_rank_server()
 
     async def terminate(self):
         self._running = False
+        await self._stop_rank_server()
+
         if self._scheduler_task and not self._scheduler_task.done():
             self._scheduler_task.cancel()
             try:
@@ -47,6 +68,28 @@ class QunHelperPlugin(Star):
         if not group_id:
             return
         self._group_umo_cache[str(group_id)] = event.unified_msg_origin
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def collect_message_stats(self, event: AstrMessageEvent):
+        """统计群消息，用于排行榜展示。"""
+        raw = getattr(event.message_obj, "raw_message", None)
+        if self._raw_get(raw, "post_type") != "message":
+            return
+
+        group_id = str(event.get_group_id() or "").strip()
+        user_id = str(event.get_sender_id() or "").strip()
+        if not group_id or not user_id:
+            return
+
+        user_name = str(event.get_sender_name() or "").strip() or user_id
+        async with self._stats_lock:
+            self._msg_total_by_user[user_id] += 1
+            self._msg_by_group_user[group_id][user_id] += 1
+            self._user_name_cache[user_id] = user_name
+            day_key = self._today_key()
+            self._daily_speakers_by_group_day[f"{group_id}:{day_key}"].add(user_id)
+            self._cleanup_daily_speaker_cache_locked()
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -276,6 +319,138 @@ class QunHelperPlugin(Star):
         await self._persist_config()
         yield event.plain_result(f"已移除白名单群号：{group_id}")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("踢低等级")
+    async def kick_low_level_command(self, event: AstrMessageEvent):
+        """指令踢出低于指定群等级的成员。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用：/踢低等级 等级")
+            return
+
+        payload = self._extract_command_payload(event, "踢低等级")
+        threshold = self._extract_first_int(payload)
+        if threshold is None:
+            threshold = self._get_int("kick_min_level", 1)
+
+        if threshold <= 0:
+            yield event.plain_result("等级阈值必须大于 0。")
+            return
+
+        members = await self._get_group_member_list(event, group_id)
+        if members is None:
+            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
+            return
+
+        self_id = str(event.get_self_id() or "").strip()
+        kicked_ids: list[str] = []
+        failed_ids: list[str] = []
+        skipped_admin_cnt = 0
+
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+
+            user_id = str(member.get("user_id") or "").strip()
+            if not user_id or user_id == self_id:
+                continue
+
+            role = str(member.get("role") or "member").lower()
+            if role in {"owner", "admin"}:
+                skipped_admin_cnt += 1
+                continue
+
+            level = self._parse_member_level(member.get("level"))
+            if level is None or level >= threshold:
+                continue
+
+            ok = await self._kick_group_member(event, group_id, user_id)
+            if ok:
+                kicked_ids.append(user_id)
+            else:
+                failed_ids.append(user_id)
+
+        if not kicked_ids and not failed_ids:
+            yield event.plain_result(
+                f"已检查完成：没有低于 {threshold} 级的可踢成员。"
+            )
+            return
+
+        lines = [
+            f"踢低等级执行完成（阈值: {threshold}）",
+            f"成功踢出: {len(kicked_ids)} 人",
+            f"失败: {len(failed_ids)} 人",
+            f"跳过管理员/群主: {skipped_admin_cnt} 人",
+        ]
+        if kicked_ids:
+            lines.append("成功ID: " + ", ".join(kicked_ids[:20]))
+        if failed_ids:
+            lines.append("失败ID: " + ", ".join(failed_ids[:20]))
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("提醒未发言")
+    async def remind_silent_members_command(self, event: AstrMessageEvent):
+        """艾特今天未发言成员，并附带自定义话术。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用：/提醒未发言 自定义话术")
+            return
+
+        members = await self._get_group_member_list(event, group_id)
+        if members is None:
+            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
+            return
+
+        custom_text = self._extract_command_payload(event, "提醒未发言")
+        remind_text = custom_text or self._get_text(
+            "silent_reminder_text",
+            "今天还没发言，记得来冒个泡哦~",
+        )
+        batch_size = max(1, self._get_int("silent_reminder_batch_size", 20))
+
+        today_key = self._today_key()
+        self_id = str(event.get_self_id() or "").strip()
+        sender_id = str(event.get_sender_id() or "").strip()
+        async with self._stats_lock:
+            spoken = set(self._daily_speakers_by_group_day.get(f"{group_id}:{today_key}", set()))
+            if sender_id:
+                spoken.add(sender_id)
+
+        silent_ids: list[str] = []
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            user_id = str(member.get("user_id") or "").strip()
+            if not user_id or user_id == self_id:
+                continue
+            if user_id in spoken:
+                continue
+            silent_ids.append(user_id)
+
+        if not silent_ids:
+            yield event.plain_result("今天全员都发言了，无需提醒。")
+            return
+
+        reminded_cnt = 0
+        for uid_chunk in self._chunk_list(silent_ids, batch_size):
+            chain = MessageChain()
+            for uid in uid_chunk:
+                chain.chain.append(At(qq=uid))
+                chain.chain.append(Plain(text=" "))
+            chain.chain.append(Plain(text=remind_text))
+
+            try:
+                await self.context.send_message(event.unified_msg_origin, chain)
+                reminded_cnt += len(uid_chunk)
+            except Exception as exc:
+                logger.error("提醒未发言发送失败 group_id=%s err=%s", group_id, exc)
+
+        yield event.plain_result(
+            f"提醒完成：未发言 {len(silent_ids)} 人，已发送提醒 {reminded_cnt} 人。"
+        )
+
     async def _scheduled_sender_loop(self):
         while self._running:
             await asyncio.sleep(15)
@@ -353,6 +528,34 @@ class QunHelperPlugin(Star):
         except Exception:
             logger.warning("welcome_template 格式错误，已回退到默认欢迎语。")
             return f"欢迎新成员 {user_id} 加入本群，当前时间：{notify_time}。"
+
+    def _build_kick_notice_message(
+        self,
+        group_id: str,
+        user_id: str,
+        member_level: int,
+        min_level: int,
+        notify_time: str,
+    ) -> str:
+        template = self._get_text(
+            "kick_notice_template",
+            "成员 {user_id} 的群等级 {level} 低于要求 {min_level}，已移出本群。当前时间：{time}。",
+        )
+        try:
+            message = template.format(
+                group_id=group_id,
+                user_id=user_id,
+                level=member_level,
+                min_level=min_level,
+                time=notify_time,
+            )
+            return self._ensure_time_visible(message, notify_time)
+        except Exception:
+            logger.warning("kick_notice_template 格式错误，已回退到默认提示。")
+            return (
+                f"成员 {user_id} 的群等级 {member_level} 低于要求 {min_level}，"
+                f"已移出本群。当前时间：{notify_time}。"
+            )
 
     def _build_leave_message(
         self,
@@ -440,6 +643,365 @@ class QunHelperPlugin(Star):
     @staticmethod
     def _format_now_str() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    async def _try_auto_kick_low_level_member(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+    ) -> bool:
+        if not self._get_bool("enable_auto_kick_low_level", False):
+            return False
+
+        target_groups = set(self._get_str_list("kick_group_whitelist"))
+        if group_id not in target_groups:
+            return False
+
+        min_level = self._get_int("kick_min_level", 1)
+        if min_level <= 0:
+            return False
+
+        member_level = await self._get_member_level(event, group_id, user_id)
+        if member_level is None:
+            return False
+
+        if member_level >= min_level:
+            return False
+
+        kicked = await self._kick_group_member(event, group_id, user_id)
+        if not kicked:
+            return False
+
+        if self._get_bool("enable_kick_notice", True):
+            try:
+                notify_time = self._format_now_str()
+                text = self._build_kick_notice_message(
+                    group_id=group_id,
+                    user_id=user_id,
+                    member_level=member_level,
+                    min_level=min_level,
+                    notify_time=notify_time,
+                )
+                await self._send_group_notice(
+                    event.unified_msg_origin,
+                    text=text,
+                    image_source="",
+                    at_user_id=user_id,
+                )
+            except Exception as exc:
+                logger.error("发送踢人提示失败 group_id=%s user_id=%s err=%s", group_id, user_id, exc)
+
+        return True
+
+    async def _get_member_level(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+    ) -> int | None:
+        result = await self._call_aiocqhttp_action(
+            event,
+            "get_group_member_info",
+            group_id=int(group_id) if group_id.isdigit() else group_id,
+            user_id=int(user_id) if user_id.isdigit() else user_id,
+            no_cache=True,
+        )
+        data = self._extract_action_data(result)
+        if not isinstance(data, dict):
+            return None
+
+        return self._parse_member_level(data.get("level"))
+
+    async def _kick_group_member(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+    ) -> bool:
+        result = await self._call_aiocqhttp_action(
+            event,
+            "set_group_kick",
+            group_id=int(group_id) if group_id.isdigit() else group_id,
+            user_id=int(user_id) if user_id.isdigit() else user_id,
+            reject_add_request=False,
+        )
+
+        if result is None:
+            logger.error("踢人失败，调用 set_group_kick 无返回。group_id=%s user_id=%s", group_id, user_id)
+            return False
+
+        if isinstance(result, dict):
+            status = str(result.get("status") or "").lower()
+            if status and status != "ok":
+                logger.error("踢人失败 group_id=%s user_id=%s ret=%s", group_id, user_id, result)
+                return False
+
+        return True
+
+    async def _call_aiocqhttp_action(
+        self,
+        event: AstrMessageEvent,
+        action: str,
+        **kwargs,
+    ) -> Any:
+        bot = getattr(event, "bot", None)
+
+        try:
+            if bot and callable(getattr(bot, "call_action", None)):
+                return await bot.call_action(action, **kwargs)
+
+            api = getattr(bot, "api", None) if bot else None
+            if api and callable(getattr(api, "call_action", None)):
+                return await api.call_action(action, **kwargs)
+
+            platform = self.context.get_platform(filter.PlatformAdapterType.AIOCQHTTP)
+            get_client = getattr(platform, "get_client", None)
+            client = get_client() if callable(get_client) else None
+            if client and callable(getattr(client, "call_action", None)):
+                return await client.call_action(action, **kwargs)
+
+            client_api = getattr(client, "api", None) if client else None
+            if client_api and callable(getattr(client_api, "call_action", None)):
+                return await client_api.call_action(action, **kwargs)
+        except Exception as exc:
+            logger.error("调用 OneBot API 失败 action=%s err=%s", action, exc)
+
+        return None
+
+    @staticmethod
+    def _extract_action_data(result: Any) -> Any:
+        if isinstance(result, dict) and isinstance(result.get("data"), dict):
+            return result.get("data")
+        return result
+
+    @staticmethod
+    def _parse_member_level(value: Any) -> int | None:
+        if isinstance(value, int):
+            return value
+
+        text = str(value or "").strip()
+        if not text:
+            return None
+
+        if text.isdigit():
+            return int(text)
+
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if not digits:
+            return None
+        return int(digits)
+
+    @staticmethod
+    def _extract_first_int(text: str) -> int | None:
+        content = str(text or "").strip()
+        if not content:
+            return None
+
+        first = content.split()[0]
+        if first.isdigit():
+            return int(first)
+        return None
+
+    def _get_int(self, key: str, default: int) -> int:
+        value = self.config.get(key, default)
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    async def _get_group_member_list(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+    ) -> list[dict[str, Any]] | None:
+        result = await self._call_aiocqhttp_action(
+            event,
+            "get_group_member_list",
+            group_id=int(group_id) if group_id.isdigit() else group_id,
+        )
+        data = self._extract_action_data(result)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        return None
+
+    @staticmethod
+    def _today_key() -> str:
+        return datetime.now().date().isoformat()
+
+    def _cleanup_daily_speaker_cache_locked(self) -> None:
+        today = datetime.now().date()
+        expired_keys: list[str] = []
+        for key in self._daily_speakers_by_group_day.keys():
+            try:
+                _, date_text = key.rsplit(":", 1)
+                day = datetime.strptime(date_text, "%Y-%m-%d").date()
+                if (today - day).days > self._daily_speaker_keep_days:
+                    expired_keys.append(key)
+            except Exception:
+                expired_keys.append(key)
+
+        for key in expired_keys:
+            self._daily_speakers_by_group_day.pop(key, None)
+
+    @staticmethod
+    def _chunk_list(items: list[str], size: int):
+        for i in range(0, len(items), size):
+            yield items[i : i + size]
+
+    async def _start_rank_server(self) -> None:
+        if self._rank_app_runner is not None:
+            return
+
+        port = self._get_int("rank_server_port", 16666)
+        if port <= 0:
+            port = 16666
+
+        app = web.Application()
+        app.router.add_get("/", self._handle_rank_index)
+        app.router.add_get("/api/rankings", self._handle_rank_api)
+
+        runner = web.AppRunner(app)
+        try:
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+            self._rank_app_runner = runner
+            self._rank_site = site
+            logger.info("消息排行榜服务已启动: http://0.0.0.0:%s", port)
+        except Exception as exc:
+            logger.error("启动消息排行榜服务失败 port=%s err=%s", port, exc)
+            try:
+                await runner.cleanup()
+            except Exception:
+                pass
+
+    async def _stop_rank_server(self) -> None:
+        if self._rank_app_runner is None:
+            return
+
+        try:
+            await self._rank_app_runner.cleanup()
+        except Exception as exc:
+            logger.error("关闭消息排行榜服务失败 err=%s", exc)
+        finally:
+            self._rank_site = None
+            self._rank_app_runner = None
+
+    async def _handle_rank_api(self, _request: web.Request) -> web.Response:
+        snapshot = await self._build_rank_snapshot()
+        return web.json_response(snapshot)
+
+    async def _handle_rank_index(self, _request: web.Request) -> web.Response:
+        snapshot = await self._build_rank_snapshot()
+        html = self._render_rank_html(snapshot)
+        return web.Response(text=html, content_type="text/html", charset="utf-8")
+
+    async def _build_rank_snapshot(self) -> dict[str, Any]:
+        async with self._stats_lock:
+            total = dict(self._msg_total_by_user)
+            by_group = {gid: dict(data) for gid, data in self._msg_by_group_user.items()}
+            names = dict(self._user_name_cache)
+
+        total_rows = sorted(total.items(), key=lambda item: item[1], reverse=True)
+        total_top = [
+            {
+                "rank": idx,
+                "user_id": user_id,
+                "user_name": names.get(user_id, user_id),
+                "count": count,
+            }
+            for idx, (user_id, count) in enumerate(total_rows[:100], start=1)
+        ]
+
+        group_top: dict[str, list[dict[str, Any]]] = {}
+        for group_id, group_data in by_group.items():
+            rows = sorted(group_data.items(), key=lambda item: item[1], reverse=True)
+            group_top[group_id] = [
+                {
+                    "rank": idx,
+                    "user_id": user_id,
+                    "user_name": names.get(user_id, user_id),
+                    "count": count,
+                }
+                for idx, (user_id, count) in enumerate(rows[:50], start=1)
+            ]
+
+        return {
+            "generated_at": self._format_now_str(),
+            "total_top": total_top,
+            "group_top": group_top,
+        }
+
+    def _render_rank_html(self, snapshot: dict[str, Any]) -> str:
+        generated_at = escape(str(snapshot.get("generated_at", "")))
+        total_top = snapshot.get("total_top", [])
+        group_top = snapshot.get("group_top", {})
+
+        total_rows_html = "".join(
+            (
+                "<tr>"
+                f"<td>{row.get('rank')}</td>"
+                f"<td>{escape(str(row.get('user_name', '')))}</td>"
+                f"<td>{escape(str(row.get('user_id', '')))}</td>"
+                f"<td>{row.get('count')}</td>"
+                "</tr>"
+            )
+            for row in total_top
+        )
+        if not total_rows_html:
+            total_rows_html = "<tr><td colspan='4'>暂无数据</td></tr>"
+
+        group_sections: list[str] = []
+        for group_id in sorted(group_top.keys()):
+            rows = group_top[group_id]
+            rows_html = "".join(
+                (
+                    "<tr>"
+                    f"<td>{row.get('rank')}</td>"
+                    f"<td>{escape(str(row.get('user_name', '')))}</td>"
+                    f"<td>{escape(str(row.get('user_id', '')))}</td>"
+                    f"<td>{row.get('count')}</td>"
+                    "</tr>"
+                )
+                for row in rows
+            )
+            if not rows_html:
+                rows_html = "<tr><td colspan='4'>暂无数据</td></tr>"
+
+            group_sections.append(
+                "<section>"
+                f"<h2>群 {escape(group_id)} 排行榜</h2>"
+                "<table>"
+                "<thead><tr><th>排名</th><th>昵称</th><th>用户ID</th><th>消息数</th></tr></thead>"
+                f"<tbody>{rows_html}</tbody>"
+                "</table>"
+                "</section>"
+            )
+
+        group_html = "".join(group_sections) if group_sections else "<p>暂无群排行数据</p>"
+
+        return (
+            "<!doctype html>"
+            "<html lang='zh-CN'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>消息排行榜</title>"
+            "<style>body{font-family:Segoe UI,Arial,sans-serif;margin:24px;background:#f6f8fb;color:#1f2328;}"
+            "h1,h2{margin:0 0 12px 0;}"
+            "p{margin:8px 0 16px 0;color:#57606a;}"
+            "table{width:100%;border-collapse:collapse;background:#fff;margin-bottom:20px;border-radius:8px;overflow:hidden;}"
+            "th,td{padding:10px 12px;border-bottom:1px solid #d0d7de;text-align:left;}"
+            "th{background:#f3f4f6;font-weight:600;}"
+            "tr:last-child td{border-bottom:none;}"
+            "section{margin-top:20px;}"
+            "</style></head><body>"
+            "<h1>消息排行榜</h1>"
+            f"<p>更新时间：{generated_at} ｜ API: /api/rankings</p>"
+            "<section><h2>总消息榜 TOP 100</h2>"
+            "<table><thead><tr><th>排名</th><th>昵称</th><th>用户ID</th><th>消息数</th></tr></thead>"
+            f"<tbody>{total_rows_html}</tbody></table></section>"
+            f"{group_html}"
+            "</body></html>"
+        )
 
     @staticmethod
     def _extract_first_image_source(event: AstrMessageEvent) -> str:

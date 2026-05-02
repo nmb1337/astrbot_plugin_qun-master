@@ -44,6 +44,62 @@
     "default": "",
     "hint": "可留空；填写后会与退群文字一起发送"
   },
+  "enable_rank_server": {
+    "description": "启用消息排行榜Web服务",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会启动HTTP服务展示消息排行榜"
+  },
+  "rank_server_port": {
+    "description": "排行榜端口",
+    "type": "int",
+    "default": 16666,
+    "hint": "按需求默认 16666"
+  },
+  "enable_auto_kick_low_level": {
+    "description": "启用低群等级自动踢出",
+    "type": "bool",
+    "default": false,
+    "hint": "仅对 kick_group_whitelist 内群生效"
+  },
+  "kick_group_whitelist": {
+    "description": "低群等级踢出群号白名单",
+    "type": "list",
+    "items": {
+      "type": "string"
+    },
+    "default": [],
+    "hint": "仅在这些群检测成员等级并执行踢出"
+  },
+  "kick_min_level": {
+    "description": "最低允许群等级",
+    "type": "int",
+    "default": 1,
+    "hint": "成员等级低于该值时自动踢出"
+  },
+  "enable_kick_notice": {
+    "description": "启用踢出提示通知",
+    "type": "bool",
+    "default": true,
+    "hint": "踢出成功后在群内发送提示"
+  },
+  "kick_notice_template": {
+    "description": "踢出提示模板",
+    "type": "string",
+    "default": "成员 {user_id} 的群等级 {level} 低于要求 {min_level}，已移出本群。当前时间：{time}。",
+    "hint": "可使用占位符: {user_id} {group_id} {level} {min_level} {time}"
+  },
+  "silent_reminder_text": {
+    "description": "未发言提醒默认话术",
+    "type": "string",
+    "default": "今天还没发言，记得来冒个泡哦~"
+  },
+  "silent_reminder_batch_size": {
+    "description": "未发言提醒每条消息艾特人数",
+    "type": "int",
+    "default": 20,
+    "hint": "人数较多时会分批发送，建议 10-30"
+  },
   "enable_schedule": {
     "description": "启用定时消息",
     "type": "bool",

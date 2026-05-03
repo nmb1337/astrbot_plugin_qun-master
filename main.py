@@ -453,6 +453,30 @@ class QunHelperPlugin(Star):
             yield event.plain_result("发送失败，请检查机器人发言权限。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("全体成员")
+    async def mention_all_members_command(self, event: AstrMessageEvent):
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用：/全体成员 [附加内容]")
+            return
+
+        payload = self._extract_command_payload(event, "全体成员")
+        tail_text = payload if payload else "请查看本条群通知。"
+
+        mentioned = await self._send_message_with_member_mentions(
+            event=event,
+            unified_msg_origin=event.unified_msg_origin,
+            group_id=group_id,
+            message_text=tail_text,
+            batch_size=1,
+        )
+        if mentioned is None:
+            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
+            return
+
+        yield event.plain_result(f"已逐个艾特 {mentioned} 位成员。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("踢未发言")
     async def kick_inactive_members_command(self, event: AstrMessageEvent):
         group_id = str(event.get_group_id() or "").strip()
@@ -717,7 +741,6 @@ class QunHelperPlugin(Star):
             return
 
         at_all = self._get_bool("schedule_at_all", True)
-        mention_batch_size = max(1, self._get_int("schedule_mention_batch_size", 1))
         for group_id in groups:
             umo = self._group_umo_cache.get(group_id)
             if not umo:
@@ -729,20 +752,10 @@ class QunHelperPlugin(Star):
 
             try:
                 if at_all:
-                    mentioned = await self._send_schedule_message_with_mentions(
-                        unified_msg_origin=umo,
-                        group_id=group_id,
-                        message_text=msg,
-                        batch_size=mention_batch_size,
-                    )
-                    if mentioned is None:
-                        await self.context.send_message(umo, MessageChain().message(msg))
-                    else:
-                        logger.info(
-                            "定时消息逐个艾特完成 group_id=%s mentioned=%s",
-                            group_id,
-                            mentioned,
-                        )
+                    chain = MessageChain()
+                    chain.chain.append(At(qq="all"))
+                    chain.chain.append(Plain(text=f" {msg}"))
+                    await self.context.send_message(umo, chain)
                 else:
                     await self.context.send_message(umo, MessageChain().message(msg))
             except Exception as exc:
@@ -1150,16 +1163,17 @@ class QunHelperPlugin(Star):
 
         return len(silent_ids), reminded_cnt
 
-    async def _send_schedule_message_with_mentions(
+    async def _send_message_with_member_mentions(
         self,
+        event: AstrMessageEvent | None,
         unified_msg_origin: str,
         group_id: str,
         message_text: str,
         batch_size: int,
     ) -> int | None:
-        members = await self._get_group_member_list(None, group_id)
+        members = await self._get_group_member_list(event, group_id)
         if members is None:
-            logger.warning("定时消息逐个艾特失败，无法获取成员列表 group_id=%s", group_id)
+            logger.warning("逐个艾特失败，无法获取成员列表 group_id=%s", group_id)
             return None
 
         mention_ids: list[str] = []

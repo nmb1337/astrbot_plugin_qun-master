@@ -146,16 +146,10 @@
     "hint": "24 小时制，例如 09:00 或 21:30"
   },
   "schedule_at_all": {
-    "description": "定时消息逐个艾特全体成员",
+    "description": "定时消息艾特全体成员",
     "type": "bool",
     "default": true,
-    "hint": "开启后会拉取群成员并逐个艾特，不使用 @全体成员"
-  },
-  "schedule_mention_batch_size": {
-    "description": "定时消息每条艾特人数",
-    "type": "int",
-    "default": 1,
-    "hint": "默认 1 表示一个一个艾特；人数过多可适当调大"
+    "hint": "开启后发送定时消息时会附带 @全体成员"
   },
   "schedule_message": {
     "description": "定时发送内容",

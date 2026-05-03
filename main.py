@@ -457,23 +457,72 @@ class QunHelperPlugin(Star):
     async def mention_all_members_command(self, event: AstrMessageEvent):
         group_id = str(event.get_group_id() or "").strip()
         if not group_id:
-            yield event.plain_result("请在群聊中使用：/全体成员 [附加内容]")
+            yield event.plain_result("请在群聊中使用：/全体成员 内容")
             return
 
         payload = self._extract_command_payload(event, "全体成员")
-        tail_text = payload if payload else "请查看本条群通知。"
+        tail_text = payload.strip()
+        if not tail_text:
+            yield event.plain_result("用法：/全体成员 内容")
+            return
 
-        chain = MessageChain()
-        chain.chain.append(At(qq="all"))
-        if tail_text:
-            chain.chain.append(Plain(text=f" {tail_text}"))
+        members = await self._get_group_member_list(event, group_id)
+        if members is None:
+            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
+            return
 
-        try:
-            await self.context.send_message(event.unified_msg_origin, chain)
-            yield event.plain_result("已发送 @全体成员 通知。")
-        except Exception as exc:
-            logger.error("@全体成员发送失败 group_id=%s err=%s", group_id, exc)
-            yield event.plain_result("发送失败，请检查机器人权限或今日 @全体额度。")
+        self_id = str(event.get_self_id() or "").strip()
+        mention_ids: list[str] = []
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            user_id = str(member.get("user_id") or "").strip()
+            if not user_id or user_id == self_id:
+                continue
+            mention_ids.append(user_id)
+
+        mention_ids = list(dict.fromkeys(mention_ids))
+        if not mention_ids:
+            yield event.plain_result("当前群未找到可艾特成员。")
+            return
+
+        batch_size = max(1, self._get_int("all_members_mention_batch_size", 20))
+        sent_cnt = 0
+        batch_cnt = 0
+        for uid_chunk in self._chunk_list(mention_ids, batch_size):
+            chain = MessageChain()
+            for uid in uid_chunk:
+                chain.chain.append(At(qq=uid))
+                chain.chain.append(Plain(text=" "))
+
+            if tail_text and batch_cnt == 0:
+                chain.chain.append(Plain(text=tail_text))
+
+            try:
+                await self.context.send_message(event.unified_msg_origin, chain)
+                sent_cnt += len(uid_chunk)
+                batch_cnt += 1
+            except Exception as exc:
+                logger.error("全体成员分批艾特发送失败 group_id=%s err=%s", group_id, exc)
+
+        yield event.plain_result(
+            f"已分批艾特 {sent_cnt} 位成员，共发送 {batch_cnt} 条消息。"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("设置全体艾特数量")
+    async def set_all_members_mention_batch_size_command(self, event: AstrMessageEvent):
+        payload = self._extract_command_payload(event, "设置全体艾特数量")
+        size = self._extract_first_int(payload)
+        if size is None or size <= 0:
+            yield event.plain_result("用法：/设置全体艾特数量 数字（例如 /设置全体艾特数量 20）")
+            return
+
+        # 单条艾特过多会触发风控，这里给出安全上限。
+        size = min(size, 50)
+        self.config["all_members_mention_batch_size"] = size
+        await self._persist_config()
+        yield event.plain_result(f"已设置 /全体成员 每条艾特人数为 {size}。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("踢未发言")

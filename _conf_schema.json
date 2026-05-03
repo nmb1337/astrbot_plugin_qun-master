@@ -124,6 +124,12 @@
     "default": 20,
     "hint": "人数较多时会分批发送，建议 10-30"
   },
+  "all_members_mention_batch_size": {
+    "description": "全体成员指令每条艾特人数",
+    "type": "int",
+    "default": 20,
+    "hint": "执行 /全体成员 时每条消息艾特的人数，建议 10-30（在插件设置中调整）"
+  },
   "enable_schedule": {
     "description": "启用定时消息",
     "type": "bool",

@@ -463,18 +463,17 @@ class QunHelperPlugin(Star):
         payload = self._extract_command_payload(event, "全体成员")
         tail_text = payload if payload else "请查看本条群通知。"
 
-        mentioned = await self._send_message_with_member_mentions(
-            event=event,
-            unified_msg_origin=event.unified_msg_origin,
-            group_id=group_id,
-            message_text=tail_text,
-            batch_size=1,
-        )
-        if mentioned is None:
-            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
-            return
+        chain = MessageChain()
+        chain.chain.append(At(qq="all"))
+        if tail_text:
+            chain.chain.append(Plain(text=f" {tail_text}"))
 
-        yield event.plain_result(f"已逐个艾特 {mentioned} 位成员。")
+        try:
+            await self.context.send_message(event.unified_msg_origin, chain)
+            yield event.plain_result("已发送 @全体成员 通知。")
+        except Exception as exc:
+            logger.error("@全体成员发送失败 group_id=%s err=%s", group_id, exc)
+            yield event.plain_result("发送失败，请检查机器人权限或今日 @全体额度。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("踢未发言")
@@ -1162,44 +1161,6 @@ class QunHelperPlugin(Star):
                 logger.error("提醒未发言发送失败 group_id=%s err=%s", group_id, exc)
 
         return len(silent_ids), reminded_cnt
-
-    async def _send_message_with_member_mentions(
-        self,
-        event: AstrMessageEvent | None,
-        unified_msg_origin: str,
-        group_id: str,
-        message_text: str,
-        batch_size: int,
-    ) -> int | None:
-        members = await self._get_group_member_list(event, group_id)
-        if members is None:
-            logger.warning("逐个艾特失败，无法获取成员列表 group_id=%s", group_id)
-            return None
-
-        mention_ids: list[str] = []
-        for member in members:
-            if not isinstance(member, dict):
-                continue
-            user_id = str(member.get("user_id") or "").strip()
-            if user_id:
-                mention_ids.append(user_id)
-
-        mention_ids = list(dict.fromkeys(mention_ids))
-        if not mention_ids:
-            await self.context.send_message(unified_msg_origin, MessageChain().message(message_text))
-            return 0
-
-        for uid_chunk in self._chunk_list(mention_ids, max(1, batch_size)):
-            chain = MessageChain()
-            for uid in uid_chunk:
-                chain.chain.append(At(qq=uid))
-                chain.chain.append(Plain(text=" "))
-            await self.context.send_message(unified_msg_origin, chain)
-
-        if message_text:
-            await self.context.send_message(unified_msg_origin, MessageChain().message(message_text))
-
-        return len(mention_ids)
 
     async def _collect_recent_speakers(self, group_id: str, days: int) -> set[str]:
         if days <= 0:

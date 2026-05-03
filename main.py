@@ -717,6 +717,7 @@ class QunHelperPlugin(Star):
             return
 
         at_all = self._get_bool("schedule_at_all", True)
+        mention_batch_size = max(1, self._get_int("schedule_mention_batch_size", 1))
         for group_id in groups:
             umo = self._group_umo_cache.get(group_id)
             if not umo:
@@ -728,10 +729,20 @@ class QunHelperPlugin(Star):
 
             try:
                 if at_all:
-                    chain = MessageChain()
-                    chain.chain.append(At(qq="all"))
-                    chain.chain.append(Plain(text=f" {msg}"))
-                    await self.context.send_message(umo, chain)
+                    mentioned = await self._send_schedule_message_with_mentions(
+                        unified_msg_origin=umo,
+                        group_id=group_id,
+                        message_text=msg,
+                        batch_size=mention_batch_size,
+                    )
+                    if mentioned is None:
+                        await self.context.send_message(umo, MessageChain().message(msg))
+                    else:
+                        logger.info(
+                            "定时消息逐个艾特完成 group_id=%s mentioned=%s",
+                            group_id,
+                            mentioned,
+                        )
                 else:
                     await self.context.send_message(umo, MessageChain().message(msg))
             except Exception as exc:
@@ -1138,6 +1149,43 @@ class QunHelperPlugin(Star):
                 logger.error("提醒未发言发送失败 group_id=%s err=%s", group_id, exc)
 
         return len(silent_ids), reminded_cnt
+
+    async def _send_schedule_message_with_mentions(
+        self,
+        unified_msg_origin: str,
+        group_id: str,
+        message_text: str,
+        batch_size: int,
+    ) -> int | None:
+        members = await self._get_group_member_list(None, group_id)
+        if members is None:
+            logger.warning("定时消息逐个艾特失败，无法获取成员列表 group_id=%s", group_id)
+            return None
+
+        mention_ids: list[str] = []
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            user_id = str(member.get("user_id") or "").strip()
+            if user_id:
+                mention_ids.append(user_id)
+
+        mention_ids = list(dict.fromkeys(mention_ids))
+        if not mention_ids:
+            await self.context.send_message(unified_msg_origin, MessageChain().message(message_text))
+            return 0
+
+        for uid_chunk in self._chunk_list(mention_ids, max(1, batch_size)):
+            chain = MessageChain()
+            for uid in uid_chunk:
+                chain.chain.append(At(qq=uid))
+                chain.chain.append(Plain(text=" "))
+            await self.context.send_message(unified_msg_origin, chain)
+
+        if message_text:
+            await self.context.send_message(unified_msg_origin, MessageChain().message(message_text))
+
+        return len(mention_ids)
 
     async def _collect_recent_speakers(self, group_id: str, days: int) -> set[str]:
         if days <= 0:

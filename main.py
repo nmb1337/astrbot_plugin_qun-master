@@ -730,6 +730,84 @@ class QunHelperPlugin(Star):
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("立即执行")
+    async def kick_low_level_now_command(self, event: AstrMessageEvent):
+        """按低等级规则立即执行踢人，不等待冷却。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用：/立即执行 等级")
+            return
+
+        payload = self._extract_command_payload(event, "立即执行")
+        threshold = self._extract_first_int(payload)
+        if threshold is None:
+            threshold = self._get_int("kick_min_level", 1)
+
+        if threshold <= 0:
+            yield event.plain_result("等级阈值必须大于 0。")
+            return
+
+        members = await self._get_group_member_list(event, group_id)
+        if members is None:
+            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
+            return
+
+        self_id = str(event.get_self_id() or "").strip()
+        kick_user_whitelist = set(self._get_str_list("kick_user_whitelist"))
+        kicked_ids: list[str] = []
+        failed_ids: list[str] = []
+        skipped_admin_cnt = 0
+        skipped_whitelist_cnt = 0
+
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+
+            user_id = str(member.get("user_id") or "").strip()
+            if not user_id or user_id == self_id:
+                continue
+
+            if user_id in kick_user_whitelist:
+                skipped_whitelist_cnt += 1
+                continue
+
+            role = str(member.get("role") or "member").lower()
+            if role in {"owner", "admin"}:
+                skipped_admin_cnt += 1
+                continue
+
+            level = self._parse_member_level(member.get("level"))
+            if level is None or level >= threshold:
+                continue
+
+            ok = await self._kick_group_member(event, group_id, user_id)
+            if ok:
+                kicked_ids.append(user_id)
+            else:
+                failed_ids.append(user_id)
+
+        if not kicked_ids and not failed_ids:
+            yield event.plain_result(
+                f"已检查完成：没有低于 {threshold} 级的可踢成员。"
+                f"（跳过管理员/群主 {skipped_admin_cnt} 人，"
+                f"白名单 {skipped_whitelist_cnt} 人）"
+            )
+            return
+
+        lines = [
+            f"立即执行完成（阈值: {threshold}）",
+            f"成功踢出: {len(kicked_ids)} 人",
+            f"失败: {len(failed_ids)} 人",
+            f"跳过管理员/群主: {skipped_admin_cnt} 人",
+            f"跳过白名单: {skipped_whitelist_cnt} 人",
+        ]
+        if kicked_ids:
+            lines.append("成功ID: " + ", ".join(kicked_ids[:20]))
+        if failed_ids:
+            lines.append("失败ID: " + ", ".join(failed_ids[:20]))
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("提醒未发言")
     async def remind_silent_members_command(self, event: AstrMessageEvent):
         """艾特今天未发言成员，并附带自定义话术。"""

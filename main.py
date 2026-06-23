@@ -529,9 +529,9 @@ class QunHelperPlugin(Star):
             return
 
         payload = self._extract_command_payload(event, "禁言用户")
-        seconds = self._extract_first_int(payload)
+        seconds = self._extract_last_int(payload)
         if seconds is None or seconds <= 0:
-            yield event.plain_result("用法：/禁言 @用户 秒数")
+            yield event.plain_result("用法：/禁言用户 @用户 秒数")
             return
 
         self_id = str(event.get_self_id() or "").strip()
@@ -1279,6 +1279,19 @@ class QunHelperPlugin(Star):
         first = content.split()[0]
         if first.isdigit():
             return int(first)
+        return None
+
+    @staticmethod
+    def _extract_last_int(text: str) -> int | None:
+        """提取 payload 中最后一个整数，适配 '禁言用户 @用户 秒数' 格式。"""
+        content = str(text or "").strip()
+        if not content:
+            return None
+
+        parts = content.split()
+        for part in reversed(parts):
+            if part.isdigit():
+                return int(part)
         return None
 
     def _get_int(self, key: str, default: int) -> int:

@@ -466,63 +466,119 @@ class QunHelperPlugin(Star):
             yield event.plain_result("用法：/全体成员 内容")
             return
 
-        members = await self._get_group_member_list(event, group_id)
-        if members is None:
-            yield event.plain_result("获取群成员列表失败，请检查机器人权限。")
+        chain = MessageChain()
+        chain.chain.append(At(qq="all"))
+        chain.chain.append(Plain(text=f" {tail_text}"))
+
+        try:
+            await self.context.send_message(event.unified_msg_origin, chain)
+            yield event.plain_result("已发送 @全体成员 通知。")
+        except Exception as exc:
+            logger.error("@全体成员发送失败 group_id=%s err=%s", group_id, exc)
+            yield event.plain_result("发送失败，请检查机器人发言权限或今日@全体额度。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("踢")
+    async def kick_by_mention_command(self, event: AstrMessageEvent):
+        """踢出消息中艾特的用户。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用：/踢 @用户")
+            return
+
+        target_ids = self._extract_at_ids(event)
+        if not target_ids:
+            yield event.plain_result("用法：/踢 @用户  （请艾特要踢的用户）")
             return
 
         self_id = str(event.get_self_id() or "").strip()
-        mention_ids: list[str] = []
-        for member in members:
-            if not isinstance(member, dict):
+        kicked_ids: list[str] = []
+        failed_ids: list[str] = []
+        for user_id in list(dict.fromkeys(target_ids)):
+            if user_id == self_id:
                 continue
-            user_id = str(member.get("user_id") or "").strip()
-            if not user_id or user_id == self_id:
-                continue
-            mention_ids.append(user_id)
+            ok = await self._kick_group_member(event, group_id, user_id)
+            if ok:
+                kicked_ids.append(user_id)
+            else:
+                failed_ids.append(user_id)
 
-        mention_ids = list(dict.fromkeys(mention_ids))
-        if not mention_ids:
-            yield event.plain_result("当前群未找到可艾特成员。")
+        lines = [
+            f"踢人完成",
+            f"成功踢出: {len(kicked_ids)} 人",
+            f"失败: {len(failed_ids)} 人",
+        ]
+        if kicked_ids:
+            lines.append("成功ID: " + ", ".join(kicked_ids[:20]))
+        if failed_ids:
+            lines.append("失败ID: " + ", ".join(failed_ids[:20]))
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("禁言")
+    async def ban_member_command(self, event: AstrMessageEvent):
+        """禁言艾特用户指定秒数。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用：/禁言 @用户 秒数")
             return
 
-        batch_size = max(1, self._get_int("all_members_mention_batch_size", 20))
-        sent_cnt = 0
-        batch_cnt = 0
-        for uid_chunk in self._chunk_list(mention_ids, batch_size):
-            chain = MessageChain()
-            for uid in uid_chunk:
-                chain.chain.append(At(qq=uid))
-                chain.chain.append(Plain(text=" "))
+        target_ids = self._extract_at_ids(event)
+        if not target_ids:
+            yield event.plain_result("用法：/禁言 @用户 秒数")
+            return
 
-            if tail_text and batch_cnt == 0:
-                chain.chain.append(Plain(text=tail_text))
+        payload = self._extract_command_payload(event, "禁言")
+        seconds = self._extract_first_int(payload)
+        if seconds is None or seconds <= 0:
+            yield event.plain_result("用法：/禁言 @用户 秒数")
+            return
 
-            try:
-                await self.context.send_message(event.unified_msg_origin, chain)
-                sent_cnt += len(uid_chunk)
-                batch_cnt += 1
-            except Exception as exc:
-                logger.error("全体成员分批艾特发送失败 group_id=%s err=%s", group_id, exc)
+        self_id = str(event.get_self_id() or "").strip()
+        banned_cnt = 0
+        failed_cnt = 0
+        for user_id in list(dict.fromkeys(target_ids)):
+            if user_id == self_id:
+                continue
+            ok = await self._ban_group_member(event, group_id, user_id, seconds)
+            if ok:
+                banned_cnt += 1
+            else:
+                failed_cnt += 1
 
         yield event.plain_result(
-            f"已分批艾特 {sent_cnt} 位成员，共发送 {batch_cnt} 条消息。"
+            f"禁言完成：成功 {banned_cnt} 人，失败 {failed_cnt} 人。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("设置全体艾特数量")
-    async def set_all_members_mention_batch_size_command(self, event: AstrMessageEvent):
-        payload = self._extract_command_payload(event, "设置全体艾特数量")
-        size = self._extract_first_int(payload)
-        if size is None or size <= 0:
-            yield event.plain_result("用法：/设置全体艾特数量 数字（例如 /设置全体艾特数量 20）")
+    @filter.command("解禁")
+    async def unban_member_command(self, event: AstrMessageEvent):
+        """解除艾特用户的禁言。"""
+        group_id = str(event.get_group_id() or "").strip()
+        if not group_id:
+            yield event.plain_result("请在群聊中使用：/解禁 @用户")
             return
 
-        # 单条艾特过多会触发风控，这里给出安全上限。
-        size = min(size, 50)
-        self.config["all_members_mention_batch_size"] = size
-        await self._persist_config()
-        yield event.plain_result(f"已设置 /全体成员 每条艾特人数为 {size}。")
+        target_ids = self._extract_at_ids(event)
+        if not target_ids:
+            yield event.plain_result("用法：/解禁 @用户")
+            return
+
+        self_id = str(event.get_self_id() or "").strip()
+        unbanned_cnt = 0
+        failed_cnt = 0
+        for user_id in list(dict.fromkeys(target_ids)):
+            if user_id == self_id:
+                continue
+            ok = await self._ban_group_member(event, group_id, user_id, 0)
+            if ok:
+                unbanned_cnt += 1
+            else:
+                failed_cnt += 1
+
+        yield event.plain_result(
+            f"解禁完成：成功 {unbanned_cnt} 人，失败 {failed_cnt} 人。"
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("踢未发言")
@@ -1123,6 +1179,44 @@ class QunHelperPlugin(Star):
 
         return True
 
+    async def _ban_group_member(
+        self,
+        event: AstrMessageEvent | None,
+        group_id: str,
+        user_id: str,
+        duration_seconds: int,
+    ) -> bool:
+        result = await self._call_aiocqhttp_action(
+            event,
+            "set_group_ban",
+            group_id=int(group_id) if group_id.isdigit() else group_id,
+            user_id=int(user_id) if user_id.isdigit() else user_id,
+            duration=duration_seconds,
+        )
+
+        if result is None:
+            logger.error(
+                "禁言/解禁失败，调用 set_group_ban 无返回。group_id=%s user_id=%s duration=%s",
+                group_id,
+                user_id,
+                duration_seconds,
+            )
+            return False
+
+        if isinstance(result, dict):
+            status = str(result.get("status") or "").lower()
+            if status and status != "ok":
+                logger.error(
+                    "禁言/解禁失败 group_id=%s user_id=%s duration=%s ret=%s",
+                    group_id,
+                    user_id,
+                    duration_seconds,
+                    result,
+                )
+                return False
+
+        return True
+
     async def _call_aiocqhttp_action(
         self,
         event: AstrMessageEvent | None,
@@ -1634,6 +1728,16 @@ class QunHelperPlugin(Star):
                 return file_path
 
         return ""
+
+    @classmethod
+    def _extract_at_ids(cls, event: AstrMessageEvent) -> list[str]:
+        ids: list[str] = []
+        for comp in event.get_messages():
+            if isinstance(comp, At):
+                qq = str(getattr(comp, "qq", "") or "").strip()
+                if qq and qq != "all":
+                    ids.append(qq)
+        return list(dict.fromkeys(ids))
 
     @staticmethod
     def _raw_get(raw: Any, key: str) -> Any:

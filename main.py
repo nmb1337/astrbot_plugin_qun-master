@@ -515,20 +515,20 @@ class QunHelperPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("禁言")
+    @filter.command("禁言用户")
     async def ban_member_command(self, event: AstrMessageEvent):
         """禁言艾特用户指定秒数。"""
         group_id = str(event.get_group_id() or "").strip()
         if not group_id:
-            yield event.plain_result("请在群聊中使用：/禁言 @用户 秒数")
+            yield event.plain_result("请在群聊中使用：/禁言用户 @用户 秒数")
             return
 
         target_ids = self._extract_at_ids(event)
         if not target_ids:
-            yield event.plain_result("用法：/禁言 @用户 秒数")
+            yield event.plain_result("用法：/禁言用户 @用户 秒数")
             return
 
-        payload = self._extract_command_payload(event, "禁言")
+        payload = self._extract_command_payload(event, "禁言用户")
         seconds = self._extract_first_int(payload)
         if seconds is None or seconds <= 0:
             yield event.plain_result("用法：/禁言 @用户 秒数")
@@ -551,17 +551,17 @@ class QunHelperPlugin(Star):
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("解禁")
+    @filter.command("解禁用户")
     async def unban_member_command(self, event: AstrMessageEvent):
         """解除艾特用户的禁言。"""
         group_id = str(event.get_group_id() or "").strip()
         if not group_id:
-            yield event.plain_result("请在群聊中使用：/解禁 @用户")
+            yield event.plain_result("请在群聊中使用：/解禁用户 @用户")
             return
 
         target_ids = self._extract_at_ids(event)
         if not target_ids:
-            yield event.plain_result("用法：/解禁 @用户")
+            yield event.plain_result("用法：/解禁用户 @用户")
             return
 
         self_id = str(event.get_self_id() or "").strip()
